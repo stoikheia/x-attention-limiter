@@ -363,6 +363,7 @@
       stationaryY: window.scrollY,
       detailBonusGiven: false,
       mediaBonusKeys: new Set(),
+      bonus: {}, // granted interaction bonuses by type, so an undo can take them back
       meta: null,
       metaComplete: false,
       metaSent: false,
@@ -611,6 +612,20 @@
   function interact(rec, type, bonus, extra) {
     pushInteraction(rec, { type, ts: Date.now(), ...(extra || {}) });
     addCost(rec, bonus, { interaction: bonus });
+    rec.bonus[type] = (rec.bonus[type] || 0) + bonus;
+    rec.dirty = true;
+  }
+
+  // Undoing a Like / Bookmark / Repost takes back the bonus it granted (never more than that):
+  // during tuning the signal of interest is sustained interest in the post, not the click itself.
+  function revoke(rec, type, undoType) {
+    pushInteraction(rec, { type: undoType, ts: Date.now() });
+    const amount = rec.bonus[type] || 0;
+    if (amount > 0) {
+      rec.bonus[type] = 0;
+      rec.cost = Math.max(0, rec.cost - amount);
+      rec.breakdown.interaction = (rec.breakdown.interaction || 0) - amount;
+    }
     rec.dirty = true;
   }
 
@@ -631,6 +646,12 @@
     if (map[tid]) {
       const rec = recOfArticle();
       if (rec) interact(rec, map[tid][0], map[tid][1]);
+      return;
+    }
+    const undo = { unlike: ['like', 'unlike'], removeBookmark: ['bookmark', 'unbookmark'], unretweet: ['repost', 'unrepost'] };
+    if (undo[tid]) {
+      const rec = recOfArticle();
+      if (rec) revoke(rec, undo[tid][0], undo[tid][1]);
       return;
     }
     const a = t.closest('a[href]');
@@ -876,7 +897,7 @@
           videoMs: rec.videoMs,
         };
       }
-      if (item.delta > 0 || item.snapshot) items.push(item);
+      if (item.delta !== 0 || item.snapshot) items.push(item); // negative = an undone interaction
     }
     if (!items.length) return;
     seq++;

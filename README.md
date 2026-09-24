@@ -40,7 +40,9 @@ delta = basePtPerSec × dt × visibility × position × dwellMultiplier (× vide
 - `dwellMultiplier`: `scrollingFactor` while scrolling; otherwise `1 + min(dwellAccelMax, stationarySeconds / dwellAccelSec)`
 - Detail page: `detailPtPerSec` while open; `detailBonus` once after `detailMinMs` (SPEC §5)
 - Photo/video viewer: `mediaBonus` once after `mediaMinMs`
-- Like / Bookmark / Reply / Repost / external link click: fixed bonuses
+- Like / Bookmark / Reply / Repost / external link click: fixed bonuses. Undoing a Like, Bookmark or
+  Repost takes that bonus back (never below zero): during tuning the signal of interest is sustained
+  interest in the post, not the click itself. The undo is recorded as an interaction.
 
 The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored per post and shown in Review.
 

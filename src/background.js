@@ -444,14 +444,15 @@ function onBatch(tabId, msg) {
     let total = 0;
     for (const it of msg.items) {
       const d = Number(it.delta) || 0;
-      if (d > 0) {
+      if (d !== 0) {
+        // negative deltas come from undone interactions (unlike etc.), bounded by the bonus granted
         total += d;
         attentionBuffer.push({ ts: now, postId: String(it.id), delta: d });
       }
     }
     state.lastActiveAt = now;
-    if (total > 0) {
-      state.consumed += total;
+    if (total !== 0) {
+      state.consumed = Math.max(0, state.consumed + total);
       scheduleFlush();
     }
     schedulePersist();
