@@ -59,6 +59,11 @@ async function init() {
   } catch {
     focusedWindowId = null;
   }
+  try {
+    for (const t of await chrome.tabs.query({ active: true })) activeTabByWindow.set(t.windowId, t.id);
+  } catch {
+    /* fall back to queries in findFocusedXTab */
+  }
   chrome.alarms.create('tick', { periodInMinutes: 1 });
   if (state.mode === 'ACTIVE' && Date.now() - (state.lastActiveAt || 0) > STALE_ACTIVE_MS) restoreAfterBrowserStart();
   refreshUnlimited();
@@ -291,13 +296,29 @@ function refreshUnlimited() {
 
 // Returns the focused X tab id, null when the user is elsewhere, or 'neutral' when the focused
 // tab is this extension's own page (the Debug page must not affect the RESET timer, SPEC §21).
+// Active tab per window as reported by tab events. `tabs.query({active:true})` can lag behind
+// tabs.onActivated right after a new tab opens (the New Tab Page), which left X ACTIVE until the
+// next navigation; the event payload is authoritative, the query is only a fallback.
+const activeTabByWindow = new Map();
+
 async function findFocusedXTab() {
   if (focusedWindowId == null || focusedWindowId === chrome.windows.WINDOW_ID_NONE) return null;
-  let tab;
-  try {
-    [tab] = await chrome.tabs.query({ active: true, windowId: focusedWindowId });
-  } catch {
-    return null;
+  let tab = null;
+  const knownId = activeTabByWindow.get(focusedWindowId);
+  if (knownId != null) {
+    try {
+      tab = await chrome.tabs.get(knownId);
+    } catch {
+      tab = null;
+    }
+    if (tab && (!tab.active || tab.windowId !== focusedWindowId)) tab = null;
+  }
+  if (!tab) {
+    try {
+      [tab] = await chrome.tabs.query({ active: true, windowId: focusedWindowId });
+    } catch {
+      return null;
+    }
   }
   if (!tab) return null;
   if (typeof tab.url === 'string' && tab.url.startsWith(DEBUG_PAGE_PREFIX)) return 'neutral';
@@ -312,6 +333,20 @@ function clearLeaveTimer() {
     clearTimeout(leaveTimer);
     leaveTimer = null;
   }
+}
+
+function armLeaveTimer() {
+  if (leaveTimer) return;
+  if (!(state.mode === 'ACTIVE' || (state.unlimited && state.inactiveSince == null))) return;
+  leaveTimer = setTimeout(async () => {
+    leaveTimer = null;
+    const t = await findFocusedXTab();
+    if (t == null) onLeftX();
+    else if (t !== 'neutral') {
+      currentXTabId = t;
+      broadcast();
+    }
+  }, settings.leaveGraceMs);
 }
 
 // Called after the grace period confirmed the user is not on X.
@@ -338,16 +373,8 @@ async function evaluate() {
     }
   } else if (neutral) {
     clearLeaveTimer();
-  } else if (!leaveTimer && (state.mode === 'ACTIVE' || (state.unlimited && state.inactiveSince == null))) {
-    leaveTimer = setTimeout(async () => {
-      leaveTimer = null;
-      const t = await findFocusedXTab();
-      if (t == null) onLeftX();
-      else if (t !== 'neutral') {
-        currentXTabId = t;
-        broadcast();
-      }
-    }, settings.leaveGraceMs);
+  } else {
+    armLeaveTimer();
   }
   broadcast();
 }
@@ -356,7 +383,14 @@ chrome.windows.onFocusChanged.addListener((wid) => {
   focusedWindowId = wid;
   ready.then(evaluate);
 });
-chrome.tabs.onActivated.addListener(() => ready.then(evaluate));
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  activeTabByWindow.set(windowId, tabId);
+  ready.then(evaluate);
+});
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.active && tab.windowId != null) activeTabByWindow.set(tab.windowId, tab.id);
+  ready.then(evaluate);
+});
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.url || info.status === 'complete') ready.then(evaluate);
 });
@@ -413,6 +447,11 @@ function onPortMessage(tabId, msg) {
   switch (msg.type) {
     case 'visibility':
       if (p) p.visible = !!msg.visible;
+      if (!msg.visible && tabId === currentXTabId) {
+        // A hidden document cannot be ACTIVE (SPEC §7), whatever the tab query says.
+        currentXTabId = null;
+        armLeaveTimer();
+      }
       evaluate();
       break;
     case 'resume':
