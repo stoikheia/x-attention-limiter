@@ -47,7 +47,11 @@ async function refreshStatus() {
   if (!r || r.error) return;
   const { state, settings, effective, currentXTabId, xTabs, resetAt } = r;
   $('#st-effective').textContent = effective;
-  $('#st-mode').textContent = `mode ${state.mode}${currentXTabId != null ? ` · measuring tab ${currentXTabId}` : ''}`;
+  const sub = [`mode ${state.mode}`];
+  if (state.blockPending) sub.push('BLOCK PENDING');
+  if (state.mode === 'BLOCKED' && state.blockReason) sub.push(`reason ${state.blockReason}`);
+  if (currentXTabId != null) sub.push(`measuring tab ${currentXTabId}`);
+  $('#st-mode').textContent = sub.join(' · ');
   $('#st-consumed').textContent = fmtN(state.consumed);
   $('#st-limit').textContent = fmtN(settings.limit);
   const rem = Math.max(0, settings.limit - state.consumed);
@@ -434,6 +438,9 @@ const FIELD_HELP = {
   resetHours: 'Continuous absence for FULL RESET (h)',
   leaveGraceMs: 'Grace before leaving counts (ms)',
   debug: 'Debug mode (show hidden values, save snapshots)',
+  'block.tolerancePx': 'Scroll tolerance around the posts on screen (px)',
+  'block.maxPendingMs': 'Longest pending window after the LIMIT (ms)',
+  'block.onNavigation': 'Navigating away from the posts on screen blocks at once',
 };
 
 function numField(path, value, label) {
@@ -516,6 +523,11 @@ function fillSettings(s) {
   const pr = $('#set-periods');
   pr.textContent = '';
   for (const p of s.unlimitedPeriods) pr.appendChild(periodRow(p));
+  const bl = $('#set-block');
+  bl.textContent = '';
+  bl.appendChild(numField('block.tolerancePx', s.block.tolerancePx, FIELD_HELP['block.tolerancePx']));
+  bl.appendChild(numField('block.maxPendingMs', s.block.maxPendingMs, FIELD_HELP['block.maxPendingMs']));
+  bl.appendChild(boolField('block.onNavigation', s.block.onNavigation, FIELD_HELP['block.onNavigation']));
   const c = $('#set-cost');
   c.textContent = '';
   for (const [k, v] of Object.entries(s.cost)) c.appendChild(numField(`cost.${k}`, v));
@@ -528,12 +540,12 @@ $('#set-period-add').addEventListener('click', () => $('#set-periods').appendChi
 
 $('#settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const patch = { cost: {}, snapshot: {} };
-  for (const i of $$('#set-general input, #set-cost input, #set-snapshot input')) {
+  const patch = {};
+  for (const i of $$('#set-general input, #set-block input, #set-cost input, #set-snapshot input')) {
     const val = i.type === 'checkbox' ? i.checked : Number(i.value);
     if (i.type !== 'checkbox' && !Number.isFinite(val)) continue;
     const [a, b] = i.name.split('.');
-    if (b) patch[a][b] = val;
+    if (b) (patch[a] = patch[a] || {})[b] = val;
     else patch[a] = val;
   }
   patch.unlimitedPeriods = $$('#set-periods .period').map((r) => r._get()).filter(isValidPeriod);

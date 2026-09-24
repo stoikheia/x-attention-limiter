@@ -19,8 +19,8 @@ Debug mode is ON by default (SPEC §18-19): the meter shows exact numbers and po
 
 | Piece | File | Role |
 |---|---|---|
-| Service worker | `src/background.js` | Global state machine (`ACTIVE` / `INACTIVE`=BLACKOUT / `BLOCKED`, `UNLIMITED` overlay), focus tracking, 2 h reset timer, IndexedDB writer |
-| Content script | `src/content/content.js` | Post tracking (IntersectionObserver + MutationObserver), cost model at 100 ms, `+xxx pt` badges, meter, BLACKOUT / BLOCK overlays |
+| Service worker | `src/background.js` | Global state machine (`ACTIVE`, `ACTIVE` + BLOCK_PENDING, `INACTIVE`=BLACKOUT, `BLOCKED`, `UNLIMITED` overlay), focus tracking, 2 h reset timer, IndexedDB writer |
+| Content script | `src/content/content.js` | Post tracking (IntersectionObserver + MutationObserver), cost model at 100 ms, `+xxx pt` badges, meter, BLOCK_PENDING masks, BLACKOUT / BLOCK overlays |
 | Debug page | `src/debug/` | Status, Attention Review (X-like timeline, manual Low/Normal/High labels), Attention History (line chart, state backgrounds, RESET/BLOCK markers, range → Review drill-down), Settings, data export (raw JSON, and an "Export for AI" Markdown analysis pack built by `src/debug/export.js`) |
 | Shared | `src/shared/` | IndexedDB helper, default settings, UNLIMITED period logic |
 
@@ -48,8 +48,15 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
 
 ### Decisions made while implementing (spec left them open)
 
-- **BLOCK release**: the reset timer starts at the moment of BLOCK; after `resetHours` of continuous
-  absence a FULL RESET returns to BLACKOUT ("reset done"). No manual release exists outside Debug.
+- **Reaching the LIMIT** does not cut a post in half: it arms BLOCK_PENDING (SPEC Amendments v0.3,
+  settings under *Block timing*). The posts that were on screen at that moment may be finished —
+  every other post is covered by an opaque mask and generates no cost — and X is blocked on the
+  next piece of new information: scrolling out of that extent by more than `block.tolerancePx`,
+  navigating if `block.onNavigation`, or `block.maxPendingMs` elapsing (the worker enforces the
+  timeout too). Leaving X while pending blocks on the next **Return to X**, keeping the absence
+  already accumulated. **BLOCK release**: the reset timer starts at the moment of BLOCK; after
+  `resetHours` of continuous absence a FULL RESET returns to BLACKOUT ("reset done"). No manual
+  release exists outside Debug.
 - **Entering UNLIMITED while ACTIVE** ends the controlled session (mode → INACTIVE); usage during
   UNLIMITED never adds cost. The absence clock (SPEC §11) only runs while the user is *not on X*, in
   any period: reading X all night does not count as absence, so the morning starts with yesterday's
@@ -70,6 +77,7 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
 ```
 python3 tools/gen_icons.py     # regenerate icons/ (needs Pillow)
 node --check src/content/content.js
+node tools/test_blockpending.mjs  # tests the BLOCK_PENDING trigger (src/shared/blockpending.js)
 node tools/test_export.mjs     # tests the "Export for AI" Markdown builder (src/debug/export.js)
 ```
 

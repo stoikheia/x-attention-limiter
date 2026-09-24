@@ -8,6 +8,12 @@ export const DEFAULT_SETTINGS = {
     // { start: "HH:MM", end: "HH:MM", days?: [0..6] (Sun=0) }
     { start: '21:00', end: '06:00' },
   ],
+  block: {
+    // Reaching the LIMIT arms BLOCK_PENDING instead of blocking at once (SPEC Amendments v0.3).
+    tolerancePx: 120, // scrolling this far beyond the posts that were on screen still counts as finishing them
+    maxPendingMs: 300000, // hard end of the pending window (5 min)
+    onNavigation: true, // a route change (detail page, media viewer, another timeline) blocks at once
+  },
   cost: {
     basePtPerSec: 10, // full-visibility, center-of-viewport, stationary base rate
     minVisibleRatio: 0.15, // below this share of the post visible, no cost

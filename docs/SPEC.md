@@ -1090,3 +1090,65 @@ Then use it for real for several days to a week and verify
 **how well the Attention Cost matches "the posts I actually paid strong attention to".**
 
 Use the result to tune the Cost formula and the LIMIT, and only once that is convincing, move to the normal mode **"hard BLOCK with hidden remaining amount"**.
+
+---
+
+## Amendments (v0.3)
+
+### A1. BLOCK_PENDING — finish what is on screen
+
+§14 blocked the moment Attention Cost reached the LIMIT, which could cut a post in half. The
+transition now has an intermediate stage.
+
+```text
+ACTIVE
+  ↓
+Attention LIMIT
+  ↓
+BLOCK_PENDING     finish what is on screen
+  ↓
+new information
+  ↓
+BLOCKED
+```
+
+BLOCK_PENDING is not a separate mode: the state stays `ACTIVE` with a `blockPending` flag, so
+measurement continues as before. The Attention Cost may therefore exceed the LIMIT; that is
+intended and is not corrected.
+
+#### What may still be done
+
+The posts that were on screen at the moment the LIMIT was reached may be finished. Their
+**extent** (the top of the topmost visible post to the bottom of the bottommost visible one, in
+document coordinates) is recorded; with no post on screen, the viewport itself is the extent.
+
+Every post that was **not** on screen at that moment is covered by an **opaque** mask, whether it
+was already loaded or arrives afterwards. A masked post cannot be read and generates no Attention
+Cost, so scrolling inside the tolerance cannot be used to keep reading.
+
+#### What triggers BLOCK
+
+Whichever comes first:
+
+| Trigger | Condition |
+|---|---|
+| Scroll | the viewport leaves the extent by more than `block.tolerancePx` in either direction |
+| Navigation | the route changes (post detail, media viewer, another timeline), if `block.onNavigation` |
+| Timeout | `block.maxPendingMs` have passed since the LIMIT was reached |
+
+Scrolling *within* the extent — finishing a long post, trackpad jitter up and down — is allowed,
+and coming back inside does not move the extent: it is fixed at the moment the LIMIT was reached.
+
+The timeout is also enforced by the service worker, so a stopped or dead content script cannot
+keep a pending session open.
+
+#### Leaving X while pending
+
+Leaving X while pending is ordinary absence: BLACKOUT is shown and the RESET clock runs (§9, §11).
+The pending state survives, so the next **Return to X** goes straight to BLOCK instead of ACTIVE,
+and the absence accumulated since the LIMIT was reached **keeps counting** — the user never used X
+in between, so §12 does not apply. A FULL RESET during that absence clears the pending state with
+everything else.
+
+Entering UNLIMITED ends the controlled session and with it the pending state (§17). The Attention
+Cost stays, so the next Return to X during the controlled period blocks at once.

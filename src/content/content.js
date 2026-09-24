@@ -23,6 +23,8 @@
     blockedBody: 'X has been stopped',
     idle: 'X is in use elsewhere. Click here to use it in this window.',
     meter: 'Attention',
+    pending: 'Limit reached — finish what is on screen',
+    masked: 'Hidden — limit reached',
   };
 
   const MAX_RECORDS = 1500; // LRU cap on tracked posts per tab
@@ -40,7 +42,13 @@
     limit: 10000,
     minCost: 5,
     fromUnlimited: false,
+    blockPending: false, // LIMIT reached; what is on screen may still be finished
     session: null, // worker session counter; changes on FULL RESET
+    block: {
+      tolerancePx: 120,
+      maxPendingMs: 300000,
+      onNavigation: true,
+    },
     cost: {
       basePtPerSec: 10,
       minVisibleRatio: 0.15,
@@ -136,8 +144,11 @@
       S.debug = !!msg.debug;
       S.consumed = msg.consumed || 0;
       S.limit = msg.limit || S.limit;
+      S.blockPending = !!msg.blockPending;
+      if (msg.block) S.block = { ...S.block, ...msg.block };
       if (msg.cost) S.cost = { ...S.cost, ...msg.cost };
       if (msg.snapshot && msg.snapshot.minCost != null) S.minCost = msg.snapshot.minCost;
+      syncPending();
       render();
     } else if (msg.type === 'ack') {
       S.consumed = msg.consumed;
@@ -164,6 +175,10 @@
       letter-spacing:.02em;white-space:nowrap}
     html[data-xal-theme="light"] .xal-badge{color:#0f7b3d}
     html[data-xal-hide] .xal-badge{display:none}
+    .xal-mask{position:absolute;inset:0;z-index:6;pointer-events:auto;background:#000;
+      display:flex;align-items:center;justify-content:center;text-align:center;color:#9aa0a6;
+      font:600 12px/1 -apple-system,system-ui,sans-serif}
+    html[data-xal-hide] .xal-mask{display:none}
   `;
   (document.head || document.documentElement).appendChild(styleEl);
 
@@ -293,6 +308,8 @@
         :host{all:initial}
         .m{background:rgba(0,0,0,.72);color:#e7e9ea;border-radius:10px;padding:8px 10px;
           font:11px/1.3 -apple-system,system-ui,sans-serif;min-width:120px;backdrop-filter:blur(4px)}
+        .m.pending{border-top:2px solid #e0245e}
+        .p{margin-top:5px;color:#ffb3c4;font-weight:600;white-space:nowrap}
         .l{color:#9aa0a6;font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px}
         .bar{display:flex;gap:2px}
         .b{width:8px;height:12px;border-radius:2px;background:#3a3f44}
@@ -301,7 +318,8 @@
         .b.crit{background:#e0245e}
         .d{margin-top:5px;color:#c9d1d9;font-variant-numeric:tabular-nums;white-space:nowrap}
       </style>
-      <div class="m"><div class="l">${STRINGS.meter}</div><div class="bar" id="bar"></div><div class="d" id="d"></div></div>`;
+      <div class="m" id="m"><div class="l">${STRINGS.meter}</div><div class="bar" id="bar"></div>
+        <div class="p" id="p">${STRINGS.pending}</div><div class="d" id="d"></div></div>`;
     const bar = meterRoot.getElementById('bar');
     for (let i = 0; i < METER_BLOCKS; i++) {
       const b = document.createElement('span');
@@ -317,11 +335,15 @@
     meterHost.style.display = show ? 'block' : 'none';
     if (!show) return;
     const ratio = S.limit > 0 ? Math.min(1, S.consumed / S.limit) : 0;
-    const on = Math.round(ratio * METER_BLOCKS);
+    // While pending the bar is full and critical whatever the ratio: the limit is already reached.
+    const pending = S.blockPending && S.mode === 'ACTIVE' && !S.unlimited;
+    const on = pending ? METER_BLOCKS : Math.round(ratio * METER_BLOCKS);
     const blocks = meterRoot.querySelectorAll('.b');
     blocks.forEach((b, i) => {
-      b.className = 'b' + (i < on ? (ratio >= 0.9 ? ' crit' : ratio >= 0.7 ? ' hot' : ' on') : '');
+      b.className = 'b' + (i < on ? (pending || ratio >= 0.9 ? ' crit' : ratio >= 0.7 ? ' hot' : ' on') : '');
     });
+    meterRoot.getElementById('m').className = 'm' + (pending ? ' pending' : '');
+    meterRoot.getElementById('p').style.display = pending ? '' : 'none'; // shown outside Debug too
     const d = meterRoot.getElementById('d');
     if (S.debug) {
       d.style.display = '';
@@ -511,6 +533,7 @@
     rec.el = el;
     if (!rec.metaComplete) refreshMeta(rec);
     attachBadge(el, rec);
+    maskPost(el, id); // a post that arrives while pending was not on screen at arming time
     return rec;
   }
 
@@ -520,6 +543,7 @@
       const id = elToId.get(el);
       const rec = posts.get(id);
       if (rec && !rec.el) rec.el = el;
+      maskPost(el, id);
       io.observe(el);
       return id;
     }
@@ -683,6 +707,97 @@
     return false;
   }
 
+  // ------------------------------------------------------------ BLOCK_PENDING (SPEC Amendments v0.3)
+
+  // The LIMIT is reached, but the post being read is not cut in half: the posts that were on
+  // screen at that moment may be finished, and X ends as soon as new information arrives. Every
+  // other post is covered by an opaque mask, so the scroll tolerance cannot buy extra reading.
+  const pend = { armed: false, armedAt: 0, top: 0, bottom: 0, path: null, sent: false, allowed: new Set() };
+  const masks = new Set();
+  let maskByEl = new WeakMap();
+
+  function armPending() {
+    const H = window.innerHeight;
+    const sy = window.scrollY;
+    let top = Infinity;
+    let bottom = -Infinity;
+    const allowed = new Set();
+    for (const el of visibleEls) {
+      if (!el.isConnected) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height <= 0 || r.bottom <= 0 || r.top >= H) continue;
+      top = Math.min(top, r.top + sy);
+      bottom = Math.max(bottom, r.bottom + sy);
+      const id = elToId.get(el);
+      if (id) allowed.add(id); // a partially visible post is allowed in full: it is being read
+    }
+    if (!(top < bottom)) {
+      top = sy; // no post on screen (DMs, settings): the viewport itself is the extent
+      bottom = sy + H;
+    }
+    pend.armed = true;
+    pend.armedAt = Date.now();
+    pend.top = top;
+    pend.bottom = bottom;
+    pend.path = location.pathname;
+    pend.sent = false;
+    pend.allowed = allowed;
+    applyMasks();
+  }
+
+  function disarmPending() {
+    pend.armed = false;
+    pend.allowed = new Set();
+    for (const m of masks) m.remove();
+    masks.clear();
+    maskByEl = new WeakMap();
+  }
+
+  function maskPost(el, id) {
+    if (!pend.armed || !id || pend.allowed.has(id)) return;
+    const cur = maskByEl.get(el);
+    if (cur && cur.isConnected) return;
+    const m = document.createElement('div');
+    m.className = 'xal-mask';
+    m.dataset.xalInst = INSTANCE_ID;
+    m.textContent = STRINGS.masked;
+    try {
+      if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+    } catch {
+      /* ignore */
+    }
+    el.appendChild(m);
+    maskByEl.set(el, m);
+    masks.add(m);
+  }
+
+  function applyMasks() {
+    if (!pend.armed) return;
+    for (const m of masks) if (!m.isConnected) masks.delete(m);
+    for (const el of visibleEls) if (el.isConnected) maskPost(el, elToId.get(el));
+  }
+
+  function isMasked(el) {
+    const m = maskByEl.get(el);
+    return !!(m && m.isConnected);
+  }
+
+  // Mirrors shouldBlock() in src/shared/blockpending.js (content scripts cannot import modules);
+  // keep the two in sync. Precedence when several conditions hold: timeout > navigation > scroll.
+  function pendingReason(now) {
+    const B = S.block;
+    if (now - pend.armedAt > B.maxPendingMs) return 'timeout';
+    if (location.pathname !== pend.path && B.onNavigation) return 'navigation';
+    if (window.scrollY < pend.top - B.tolerancePx || window.scrollY + window.innerHeight > pend.bottom + B.tolerancePx) return 'scroll';
+    return null;
+  }
+
+  function syncPending() {
+    const want = S.blockPending && S.active && S.mode === 'ACTIVE' && !S.unlimited;
+    if (want && !pend.armed) armPending();
+    else if (!want && pend.armed) disarmPending();
+  }
+
   // ------------------------------------------------------------ measurement tick (100 ms)
 
   let lastTick = performance.now();
@@ -716,6 +831,7 @@
       const id = elToId.get(el);
       const rec = id && posts.get(id);
       if (!rec) continue;
+      if (isMasked(el)) continue; // covered while pending: nothing to read, nothing to charge
       const r = el.getBoundingClientRect();
       if (r.height <= 0 || r.bottom <= 0 || r.top >= H) continue;
       const visTop = Math.max(r.top, 0);
@@ -804,6 +920,13 @@
     if (now - lastRekeyAt > 1000) {
       lastRekeyAt = now;
       revalidateIds();
+    }
+    if (pend.armed) {
+      applyMasks();
+      if (!pend.sent) {
+        const reason = pendingReason(Date.now());
+        if (reason && send({ type: 'blockNow', reason })) pend.sent = true;
+      }
     }
     measure(dt, now);
     renderBadges();
@@ -931,6 +1054,8 @@
     clearInterval(heartbeatTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
     for (const b of document.querySelectorAll('.xal-badge')) if (b.dataset.xalInst === INSTANCE_ID) b.remove();
+    for (const m of document.querySelectorAll('.xal-mask')) if (m.dataset.xalInst === INSTANCE_ID) m.remove();
+    masks.clear();
     hideOverlay();
     if (overlayHost) overlayHost.remove();
     if (meterHost) meterHost.remove();
@@ -957,6 +1082,7 @@
   // an inline `overflow: hidden` on <html> that made the timeline unscrollable.
   if (document.readyState !== 'loading') {
     for (const b of document.querySelectorAll('.xal-badge')) if (b.dataset.xalInst !== INSTANCE_ID) b.remove();
+    for (const m of document.querySelectorAll('.xal-mask')) if (m.dataset.xalInst !== INSTANCE_ID) m.remove();
     if (document.documentElement.style.overflow === 'hidden') document.documentElement.style.overflow = '';
   }
 

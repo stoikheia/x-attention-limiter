@@ -24,6 +24,9 @@ let state = {
   unlimited: false,
   lastEffective: null,
   viewCounter: 0,
+  blockPending: false, // LIMIT reached; the user may finish what is on screen (SPEC Amendments v0.3)
+  blockPendingSince: null,
+  blockReason: null, // what ended the pending window: 'scroll' | 'navigation' | 'timeout' | ...
   blockedAt: null,
   lastActiveAt: 0, // last accepted batch or heartbeat (restores the absence origin after a browser quit)
   lastPruneAt: 0,
@@ -69,6 +72,8 @@ async function init() {
   refreshUnlimited();
   checkReset();
   scheduleResetAlarm();
+  // A dead content script must not be able to keep a pending session open forever.
+  if (state.blockPending) scheduleBlockPendingAlarm();
   await evaluate();
   if (Date.now() - (state.lastPruneAt || 0) > 6 * 3600e3) prune();
 }
@@ -106,11 +111,22 @@ const LIMITS = {
   leaveGraceMs: [0, 20000],
 };
 
+const BLOCK_LIMITS = {
+  tolerancePx: [0, 5000],
+  maxPendingMs: [10000, 3600000],
+};
+
 function clampSettings(s) {
   for (const [k, [lo, hi]] of Object.entries(LIMITS)) {
     const v = Number(s[k]);
     s[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : DEFAULT_SETTINGS[k];
   }
+  if (!s.block || typeof s.block !== 'object') s.block = structuredClone(DEFAULT_SETTINGS.block);
+  for (const [k, [lo, hi]] of Object.entries(BLOCK_LIMITS)) {
+    const v = Number(s.block[k]);
+    s.block[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : DEFAULT_SETTINGS.block[k];
+  }
+  s.block.onNavigation = !!s.block.onNavigation;
   for (const k of Object.keys(DEFAULT_SETTINGS.cost)) {
     const v = Number(s.cost[k]);
     s.cost[k] = Number.isFinite(v) && v >= 0 ? v : DEFAULT_SETTINGS.cost[k];
@@ -129,7 +145,7 @@ async function applySettings(next) {
   refreshUnlimited();
   scheduleResetAlarm();
   checkReset();
-  if (state.mode === 'ACTIVE' && state.consumed >= settings.limit) block();
+  if (state.mode === 'ACTIVE' && state.consumed >= settings.limit) armBlockPending();
   broadcast();
   return settings;
 }
@@ -207,12 +223,21 @@ function leaveX() {
   state.mode = 'INACTIVE';
   state.inactiveSince = Date.now();
   state.resetDone = false;
+  // The pending window stays armed across the absence: the session is still unfinished, so the
+  // next Return to X goes straight to BLOCK. Only the timeout alarm is pointless while away.
+  chrome.alarms.clear('blockPending');
   scheduleResetAlarm();
   commit();
 }
 
 function resume() {
   if (state.mode !== 'INACTIVE' || state.unlimited) return false;
+  // The LIMIT was already reached when the user left: returning resumes nothing. The absence
+  // accumulated since then was real absence, so it keeps counting towards the RESET (SPEC §12).
+  if (state.blockPending || state.consumed >= settings.limit) {
+    block({ reason: 'return', keepAbsence: true });
+    return true;
+  }
   state.mode = 'ACTIVE';
   state.inactiveSince = null;
   state.resetDone = false;
@@ -223,13 +248,40 @@ function resume() {
   return true;
 }
 
-function block() {
+// Arms the pending window: the LIMIT is reached, but the post being read is not cut in half.
+// The active tab (or the timeout alarm) reports the new information that ends the session.
+function armBlockPending() {
+  if (state.blockPending || state.mode !== 'ACTIVE') return;
+  state.blockPending = true;
+  state.blockPendingSince = Date.now();
+  state.blockReason = null;
+  scheduleBlockPendingAlarm();
+  commit();
+}
+
+function scheduleBlockPendingAlarm() {
+  chrome.alarms.create('blockPending', { when: (state.blockPendingSince || Date.now()) + settings.block.maxPendingMs });
+}
+
+function clearBlockPending() {
+  state.blockPending = false;
+  state.blockPendingSince = null;
+  chrome.alarms.clear('blockPending');
+}
+
+// `keepAbsence` blocks on return from an absence that started while the limit was already
+// reached: that absence was never interrupted by usage, so its clock must not restart.
+function block(opts) {
   if (state.mode === 'BLOCKED') return;
   state.mode = 'BLOCKED';
   state.blockedAt = Date.now();
+  state.blockReason = (opts && opts.reason) || null;
+  clearBlockPending();
   // Provisional (SPEC §35, "BLOCK release condition"): the reset timer starts at the moment of BLOCK.
-  state.inactiveSince = Date.now();
-  state.resetDone = false;
+  if (!(opts && opts.keepAbsence && state.inactiveSince != null)) {
+    state.inactiveSince = Date.now();
+    state.resetDone = false;
+  }
   scheduleResetAlarm();
   commit();
 }
@@ -241,6 +293,8 @@ function doReset(source) {
   state.inactiveSince = null;
   state.resetDone = true;
   state.blockedAt = null;
+  state.blockReason = null;
+  clearBlockPending();
   chrome.alarms.clear('reset');
   db.addState({ ts: Date.now(), state: 'RESET', source }).catch((e) => console.error('[XAL] addState', e));
   commit();
@@ -271,6 +325,9 @@ function refreshUnlimited() {
   const unl = isUnlimited(settings.unlimitedPeriods);
   if (unl !== state.unlimited) {
     state.unlimited = unl;
+    // The controlled session is over either way, so an armed pending window ends with it; the
+    // cost stays, so the next Return to X after UNLIMITED blocks through resume().
+    if (unl && state.blockPending) clearBlockPending();
     if (unl && state.mode === 'ACTIVE') {
       // Entering UNLIMITED ends the controlled session. The user is still on X, so the
       // absence clock does not start (SPEC §11); evaluate() starts it when they leave.
@@ -427,6 +484,8 @@ function stateFor(tabId) {
     debug: settings.debug,
     consumed: state.consumed,
     limit: settings.limit,
+    blockPending: !!state.blockPending,
+    block: settings.block,
     cost: settings.cost,
     snapshot: { minCost: settings.snapshot.minCost },
     session: state.session,
@@ -480,6 +539,13 @@ function onPortMessage(tabId, msg) {
         schedulePersist();
       }
       break;
+    case 'blockNow':
+      // The measuring tab saw new information while the pending window was armed.
+      if (state.mode === 'ACTIVE' && state.blockPending && tabId === currentXTabId) {
+        const reason = ['scroll', 'navigation', 'timeout'].includes(msg.reason) ? msg.reason : 'scroll';
+        block({ reason });
+      }
+      break;
     case 'batch':
       onBatch(tabId, msg);
       break;
@@ -513,7 +579,7 @@ function onBatch(tabId, msg) {
     }
     schedulePersist();
     if (settings.debug) upsertSnapshots(msg.items.filter((i) => i.snapshot));
-    if (state.consumed >= settings.limit) block();
+    if (state.consumed >= settings.limit) armBlockPending();
   }
   const p = ports.get(tabId);
   if (p) {
@@ -581,6 +647,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   ready.then(() => {
     if (alarm.name === 'reset' || alarm.name === 'tick') checkReset();
     if (alarm.name === 'boundary' || alarm.name === 'tick') refreshUnlimited();
+    if (alarm.name === 'blockPending' && state.mode === 'ACTIVE' && state.blockPending) block({ reason: 'timeout' });
     if (alarm.name === 'tick') {
       flushAttention();
       if (Date.now() - (state.lastPruneAt || 0) > 6 * 3600e3) prune();
@@ -662,7 +729,7 @@ async function handleMessage(msg) {
       forceBlackout();
       return { state };
     case 'debugBlock':
-      block();
+      block({ reason: 'debug' });
       return { state };
     case 'flush':
       await flushAttention();
