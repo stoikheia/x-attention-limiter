@@ -3,7 +3,7 @@
   "name": "X Attention Limiter",
   "version": "0.1.0",
   "description": "Measures attention spent on X per post and blocks X once the session limit is reached. Fully local.",
-  "permissions": ["storage", "alarms"],
+  "permissions": ["storage", "alarms", "scripting"],
   "host_permissions": [
     "https://x.com/*",
     "https://*.x.com/*",

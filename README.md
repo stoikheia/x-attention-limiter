@@ -72,4 +72,6 @@ python3 tools/gen_icons.py     # regenerate icons/ (needs Pillow)
 node --check src/content/content.js
 ```
 
-Reload the extension from `chrome://extensions` after editing; X tabs need a reload too.
+Reload the extension from `chrome://extensions` after editing. Open X tabs are re-injected
+automatically on install and reload (`scripting` permission); the previous script tears itself
+down when it notices the extension context is gone.

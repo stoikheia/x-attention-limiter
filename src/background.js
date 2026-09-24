@@ -532,7 +532,42 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
-chrome.runtime.onInstalled.addListener(() => ready.then(() => broadcast()));
+// Chrome does not inject content scripts into tabs that were already open when the extension
+// was installed or reloaded; those X tabs would stay readable for free (SPEC §9). Inject now.
+const X_URL_PATTERNS = [
+  'https://x.com/*',
+  'https://www.x.com/*',
+  'https://mobile.x.com/*',
+  'https://twitter.com/*',
+  'https://www.twitter.com/*',
+  'https://mobile.twitter.com/*',
+];
+
+async function injectIntoOpenXTabs() {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ url: X_URL_PATTERNS });
+  } catch (e) {
+    console.error('[XAL] tabs.query', e);
+    return;
+  }
+  for (const t of tabs) {
+    if (t.discarded) continue; // a discarded tab runs the script when it reloads
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['src/content/content.js'] });
+    } catch (e) {
+      console.warn('[XAL] inject failed for tab', t.id, String(e));
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() =>
+  ready.then(async () => {
+    broadcast();
+    await injectIntoOpenXTabs();
+    evaluate();
+  })
+);
 chrome.runtime.onStartup.addListener(() => ready.then(restoreAfterBrowserStart));
 
 // ---------------------------------------------------------------- debug page messages
