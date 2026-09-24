@@ -180,7 +180,6 @@
   let overlayHost = null;
   let overlayRoot = null;
   let overlayShown = false;
-  let savedOverflow = null;
 
   function ensureOverlay() {
     if (overlayHost) return;
@@ -204,6 +203,14 @@
         button:hover{background:#d7dbdc}
       </style>
       <div class="bg"><div class="box" id="box"></div></div>`;
+    // The overlay itself swallows scroll gestures (SPEC §9 "no scrolling"); the page's own
+    // overflow style is never touched, since X rewrites it too and a mismatched restore left
+    // the timeline unscrollable after the overlay was cleared (BJ-004).
+    const swallow = (e) => {
+      if (overlayShown) e.preventDefault();
+    };
+    overlayHost.addEventListener('wheel', swallow, { passive: false });
+    overlayHost.addEventListener('touchmove', swallow, { passive: false });
     document.documentElement.appendChild(overlayHost);
   }
 
@@ -241,8 +248,6 @@
     if (!overlayShown) {
       overlayShown = true;
       overlayHost.style.display = 'block';
-      savedOverflow = document.documentElement.style.overflow;
-      document.documentElement.style.overflow = 'hidden';
     }
   }
 
@@ -250,7 +255,6 @@
     if (!overlayShown) return;
     overlayShown = false;
     overlayHost.style.display = 'none';
-    document.documentElement.style.overflow = savedOverflow || '';
   }
 
   // Pre-render the overlay from the last persisted mode so the page is never briefly readable

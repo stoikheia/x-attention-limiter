@@ -3,6 +3,22 @@
 Real bugs in this extension found at runtime. Newest first. Library/browser-behaviour issues
 that we only work around go to `third-party-issues.md` instead.
 
+## BJ-004 — Timeline unscrollable after clearing BLACKOUT that followed a BLOCK (2026-09-24)
+
+- **Symptom**: after BLOCK, then RESET, then "Return to X", the page rendered normally but the
+  timeline no longer scrolled.
+- **Root cause (most likely; not reproduced by the author)**: while an overlay was shown the script
+  set `html.style.overflow = 'hidden'` and restored the previously saved inline value on hide. X
+  rewrites the same property itself (modals, media viewer), so the saved value could be stale or
+  the restore could race X's own change, leaving `overflow: hidden` in place after the overlay
+  was gone.
+- **Fix**: never touch the page's overflow style. The overlay host now swallows `wheel` and
+  `touchmove` itself (non-passive `preventDefault`), and keyboard scrolling was already blocked by
+  the key handlers, which satisfies SPEC §9 without mutating page state.
+- **Status**: fixed; needs confirmation in real use (BLOCK → RESET → Return to X → scroll).
+- **Lesson**: do not mutate host-page styles that the host page also mutates; contain behaviour
+  inside the extension's own elements.
+
 ## BJ-003 — The tab-strip "+" button still did not count as leaving X (2026-09-24)
 
 - **Symptom**: after BJ-002, Cmd+T triggered BLACKOUT but opening a tab with the tab-strip "+"
