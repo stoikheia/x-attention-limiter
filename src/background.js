@@ -3,6 +3,9 @@
 // mode      : 'ACTIVE' | 'INACTIVE' (= BLACKOUT shown on X tabs) | 'BLOCKED'
 // unlimited : true while inside an UNLIMITED period; overrides everything visually
 // effective : unlimited ? 'UNLIMITED' : mode   (recorded as StateEvent, SPEC §31)
+//
+// Absence (the RESET clock, SPEC §11) means "not on X": it runs while the user is away in any
+// mode, and while looking at BLACKOUT/BLOCK. Using X during UNLIMITED is presence, not absence.
 
 import { DEFAULT_SETTINGS, mergeSettings } from './shared/defaults.js';
 import { isUnlimited, nextBoundary } from './shared/periods.js';
@@ -10,17 +13,19 @@ import { XalDB } from './shared/db.js';
 
 const db = new XalDB();
 const X_HOST_RE = /^(www\.|mobile\.)?(x|twitter)\.com$/;
+const DEBUG_PAGE_PREFIX = chrome.runtime.getURL('');
 
 let settings = structuredClone(DEFAULT_SETTINGS);
 let state = {
   mode: 'INACTIVE',
   consumed: 0,
-  inactiveSince: null, // start of the continuous absence (reset timer origin)
+  inactiveSince: null, // start of the continuous absence (reset timer origin); null while on X
   resetDone: false, // a FULL RESET happened during the current absence
   unlimited: false,
   lastEffective: null,
   viewCounter: 0,
   blockedAt: null,
+  lastActiveAt: 0, // last time a batch was accepted (restores the absence origin after a browser quit)
   lastPruneAt: 0,
 };
 
@@ -33,24 +38,39 @@ let flushTimer = null;
 let persistTimer = null;
 let snapshotQueue = Promise.resolve();
 
-const ready = init();
+const ready = init().catch((e) => console.error('[XAL] init failed; running on defaults', e));
 
 async function init() {
-  const stored = await chrome.storage.local.get(['settings', 'state']);
-  settings = mergeSettings(DEFAULT_SETTINGS, stored.settings);
-  if (stored.state) state = { ...state, ...stored.state };
+  try {
+    const stored = await chrome.storage.local.get(['settings', 'state']);
+    settings = clampSettings(mergeSettings(DEFAULT_SETTINGS, stored.settings));
+    if (stored.state) state = { ...state, ...stored.state };
+  } catch (e) {
+    console.error('[XAL] storage read failed', e);
+  }
   try {
     const w = await chrome.windows.getLastFocused();
     focusedWindowId = w && w.focused ? w.id : null;
   } catch {
     focusedWindowId = null;
   }
-  await chrome.alarms.create('tick', { periodInMinutes: 1 });
+  chrome.alarms.create('tick', { periodInMinutes: 1 });
   refreshUnlimited();
   checkReset();
   scheduleResetAlarm();
   await evaluate();
   if (Date.now() - (state.lastPruneAt || 0) > 6 * 3600e3) prune();
+}
+
+// The browser was quit while ACTIVE: the absence started at the last accepted batch, not now.
+function restoreAfterBrowserStart() {
+  if (state.mode !== 'ACTIVE') return;
+  state.mode = 'INACTIVE';
+  state.inactiveSince = state.lastActiveAt || Date.now();
+  state.resetDone = false;
+  checkReset();
+  scheduleResetAlarm();
+  commit();
 }
 
 function isXUrl(url) {
@@ -65,6 +85,42 @@ function resetMs() {
   return settings.resetHours * 3600e3;
 }
 
+// ---------------------------------------------------------------- settings
+
+const LIMITS = {
+  limit: [1, 1e9],
+  resetHours: [0.01, 168],
+  leaveGraceMs: [0, 20000],
+};
+
+function clampSettings(s) {
+  for (const [k, [lo, hi]] of Object.entries(LIMITS)) {
+    const v = Number(s[k]);
+    s[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : DEFAULT_SETTINGS[k];
+  }
+  for (const k of Object.keys(DEFAULT_SETTINGS.cost)) {
+    const v = Number(s.cost[k]);
+    s.cost[k] = Number.isFinite(v) && v >= 0 ? v : DEFAULT_SETTINGS.cost[k];
+  }
+  for (const k of Object.keys(DEFAULT_SETTINGS.snapshot)) {
+    const v = Number(s.snapshot[k]);
+    s.snapshot[k] = Number.isFinite(v) && v >= 0 ? v : DEFAULT_SETTINGS.snapshot[k];
+  }
+  if (!Array.isArray(s.unlimitedPeriods)) s.unlimitedPeriods = [];
+  return s;
+}
+
+async function applySettings(next) {
+  settings = clampSettings(next);
+  await chrome.storage.local.set({ settings });
+  refreshUnlimited();
+  scheduleResetAlarm();
+  checkReset();
+  if (state.mode === 'ACTIVE' && state.consumed >= settings.limit) block();
+  broadcast();
+  return settings;
+}
+
 // ---------------------------------------------------------------- persistence
 
 function schedulePersist() {
@@ -72,7 +128,7 @@ function schedulePersist() {
   persistTimer = setTimeout(() => {
     persistTimer = null;
     chrome.storage.local.set({ state });
-  }, 500);
+  }, 5000);
 }
 
 function persistNow() {
@@ -126,6 +182,13 @@ async function prune() {
 
 // ---------------------------------------------------------------- transitions
 
+function startAbsence() {
+  if (state.inactiveSince == null) {
+    state.inactiveSince = Date.now();
+    scheduleResetAlarm();
+  }
+}
+
 function leaveX() {
   if (state.mode !== 'ACTIVE') return;
   state.mode = 'INACTIVE';
@@ -140,6 +203,7 @@ function resume() {
   state.mode = 'ACTIVE';
   state.inactiveSince = null;
   state.resetDone = false;
+  state.lastActiveAt = Date.now();
   chrome.alarms.clear('reset');
   commit();
   evaluate();
@@ -168,6 +232,15 @@ function doReset(source) {
   commit();
 }
 
+function forceBlackout() {
+  state.mode = 'INACTIVE';
+  state.inactiveSince = Date.now();
+  state.resetDone = false;
+  state.blockedAt = null;
+  scheduleResetAlarm();
+  commit();
+}
+
 function checkReset() {
   if (state.inactiveSince != null && Date.now() - state.inactiveSince >= resetMs()) doReset('timer');
 }
@@ -185,11 +258,15 @@ function refreshUnlimited() {
   if (unl !== state.unlimited) {
     state.unlimited = unl;
     if (unl && state.mode === 'ACTIVE') {
-      // Entering UNLIMITED ends the controlled session; the absence timer runs during UNLIMITED.
+      // Entering UNLIMITED ends the controlled session. The user is still on X, so the
+      // absence clock does not start (SPEC §11); evaluate() starts it when they leave.
       state.mode = 'INACTIVE';
-      state.inactiveSince = Date.now();
+      state.inactiveSince = null;
       state.resetDone = false;
-      scheduleResetAlarm();
+      chrome.alarms.clear('reset');
+    } else if (!unl && state.mode === 'INACTIVE' && state.inactiveSince == null && !state.resetDone) {
+      // Back to CONTROLLED while still on X: BLACKOUT counts as waiting (SPEC §9).
+      startAbsence();
     }
     commit();
   }
@@ -200,6 +277,8 @@ function refreshUnlimited() {
 
 // ---------------------------------------------------------------- focus tracking
 
+// Returns the focused X tab id, null when the user is elsewhere, or 'neutral' when the focused
+// tab is this extension's own page (the Debug page must not affect the RESET timer, SPEC §21).
 async function findFocusedXTab() {
   if (focusedWindowId == null || focusedWindowId === chrome.windows.WINDOW_ID_NONE) return null;
   let tab;
@@ -208,26 +287,51 @@ async function findFocusedXTab() {
   } catch {
     return null;
   }
-  if (!tab || !isXUrl(tab.url)) return null;
+  if (!tab) return null;
+  if (typeof tab.url === 'string' && tab.url.startsWith(DEBUG_PAGE_PREFIX)) return 'neutral';
+  if (!isXUrl(tab.url)) return null;
   const p = ports.get(tab.id);
   if (p && p.visible === false) return null;
   return tab.id;
 }
 
+function clearLeaveTimer() {
+  if (leaveTimer) {
+    clearTimeout(leaveTimer);
+    leaveTimer = null;
+  }
+}
+
+// Called after the grace period confirmed the user is not on X.
+function onLeftX() {
+  if (state.mode === 'ACTIVE') leaveX();
+  else if (state.unlimited && state.inactiveSince == null && !state.resetDone) {
+    startAbsence();
+    persistNow();
+  }
+}
+
 async function evaluate() {
-  const xTab = await findFocusedXTab();
+  const found = await findFocusedXTab();
+  const neutral = found === 'neutral';
+  const xTab = neutral ? null : found;
   currentXTabId = xTab;
   if (xTab != null) {
-    if (leaveTimer) {
-      clearTimeout(leaveTimer);
-      leaveTimer = null;
+    clearLeaveTimer();
+    if (state.unlimited && state.inactiveSince != null) {
+      // Using X during UNLIMITED is presence: the absence clock stops (nothing is recovered).
+      state.inactiveSince = null;
+      chrome.alarms.clear('reset');
+      persistNow();
     }
-  } else if (state.mode === 'ACTIVE' && !leaveTimer) {
+  } else if (neutral) {
+    clearLeaveTimer();
+  } else if (!leaveTimer && (state.mode === 'ACTIVE' || (state.unlimited && state.inactiveSince == null))) {
     leaveTimer = setTimeout(async () => {
       leaveTimer = null;
       const t = await findFocusedXTab();
-      if (t == null) leaveX();
-      else {
+      if (t == null) onLeftX();
+      else if (t !== 'neutral') {
         currentXTabId = t;
         broadcast();
       }
@@ -321,11 +425,12 @@ function onBatch(tabId, msg) {
         attentionBuffer.push({ ts: now, postId: String(it.id), delta: d });
       }
     }
+    state.lastActiveAt = now;
     if (total > 0) {
       state.consumed += total;
       scheduleFlush();
-      schedulePersist();
     }
+    schedulePersist();
     if (settings.debug) upsertSnapshots(msg.items.filter((i) => i.snapshot));
     if (state.consumed >= settings.limit) block();
   }
@@ -378,7 +483,7 @@ function upsertSnapshots(items) {
         base.timelineDwellMs += s.timelineDwellMsDelta || 0;
         base.detailDwellMs += s.detailDwellMsDelta || 0;
         base.videoMs += s.videoMsDelta || 0;
-        if (Array.isArray(s.interactions) && s.interactions.length) base.interactions = base.interactions.concat(s.interactions);
+        if (Array.isArray(s.interactions) && s.interactions.length) base.interactions = base.interactions.concat(s.interactions).slice(-200);
         base.lastSeenAt = Math.max(base.lastSeenAt, s.lastSeenAt || Date.now());
         base.firstSeenAt = Math.min(base.firstSeenAt, s.firstSeenAt || base.firstSeenAt);
         merged.push(base);
@@ -403,7 +508,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => ready.then(() => broadcast()));
-chrome.runtime.onStartup.addListener(() => ready.then(() => broadcast()));
+chrome.runtime.onStartup.addListener(() => ready.then(restoreAfterBrowserStart));
 
 // ---------------------------------------------------------------- debug page messages
 
@@ -428,27 +533,17 @@ async function handleMessage(msg) {
         resetAt: state.inactiveSince != null ? state.inactiveSince + resetMs() : null,
       };
     case 'setSettings': {
-      settings = mergeSettings(settings, msg.patch);
-      if (Array.isArray(msg.patch?.unlimitedPeriods)) settings.unlimitedPeriods = msg.patch.unlimitedPeriods;
-      await chrome.storage.local.set({ settings });
-      refreshUnlimited();
-      scheduleResetAlarm();
-      checkReset();
-      if (state.mode === 'ACTIVE' && state.consumed >= settings.limit) block();
-      broadcast();
-      return { settings };
+      const next = mergeSettings(settings, msg.patch);
+      if (Array.isArray(msg.patch?.unlimitedPeriods)) next.unlimitedPeriods = msg.patch.unlimitedPeriods;
+      return { settings: await applySettings(next) };
     }
     case 'resetSettings':
-      settings = structuredClone(DEFAULT_SETTINGS);
-      await chrome.storage.local.set({ settings });
-      refreshUnlimited();
-      broadcast();
-      return { settings };
+      return { settings: await applySettings(structuredClone(DEFAULT_SETTINGS)) };
     case 'debugReset':
       doReset('debug');
       return { state };
     case 'debugBlackout':
-      leaveX();
+      forceBlackout();
       return { state };
     case 'debugBlock':
       block();

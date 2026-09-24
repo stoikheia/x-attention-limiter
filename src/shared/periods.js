@@ -14,8 +14,9 @@ export function isValidPeriod(p) {
   return !!p && toMinutes(p.start) !== null && toMinutes(p.end) !== null && toMinutes(p.start) !== toMinutes(p.end);
 }
 
+// `days` absent = every day; an explicit empty array = never (a disabled period).
 function dayMatches(p, dayOfStart) {
-  if (!Array.isArray(p.days) || p.days.length === 0) return true;
+  if (!Array.isArray(p.days)) return true;
   return p.days.includes(dayOfStart);
 }
 
@@ -38,16 +39,26 @@ export function isUnlimited(periods, date = new Date()) {
 }
 
 // Next minute boundary (timestamp) at which isUnlimited() may change, or null when no periods.
+// Candidate boundaries are probed on wall-clock HH:MM for the next 8 days, so DST shifts and
+// day-of-week restrictions cannot produce a boundary an hour off or on a day the period is off.
 export function nextBoundary(periods, date = new Date()) {
   let best = Infinity;
+  const now = date.getTime();
   for (const p of periods || []) {
     if (!isValidPeriod(p)) continue;
     for (const t of [p.start, p.end]) {
       const mins = toMinutes(t);
-      const d = new Date(date);
-      d.setHours(Math.floor(mins / 60), mins % 60, 0, 0);
-      if (d.getTime() <= date.getTime()) d.setDate(d.getDate() + 1);
-      best = Math.min(best, d.getTime());
+      for (let dayOffset = 0; dayOffset <= 8; dayOffset++) {
+        const d = new Date(date.getFullYear(), date.getMonth(), date.getDate() + dayOffset, Math.floor(mins / 60), mins % 60, 0, 0);
+        if (d.getTime() <= now) continue;
+        // Only keep a boundary if isUnlimited() actually differs just before and just after it.
+        const before = isUnlimited([p], new Date(d.getTime() - 60e3));
+        const after = isUnlimited([p], d);
+        if (before !== after) {
+          best = Math.min(best, d.getTime());
+          break;
+        }
+      }
     }
   }
   return Number.isFinite(best) ? best : null;

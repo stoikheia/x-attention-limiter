@@ -214,7 +214,7 @@ export class HistoryChart {
   }
 
   _stateAt(ts) {
-    let s = 'ACTIVE';
+    let s = 'INACTIVE';
     for (const seg of this.d.segments) if (ts >= seg.from && ts < seg.to) s = seg.state;
     return s;
   }

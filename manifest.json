@@ -18,9 +18,11 @@
     {
       "matches": [
         "https://x.com/*",
-        "https://*.x.com/*",
+        "https://www.x.com/*",
+        "https://mobile.x.com/*",
         "https://twitter.com/*",
-        "https://*.twitter.com/*"
+        "https://www.twitter.com/*",
+        "https://mobile.twitter.com/*"
       ],
       "js": ["src/content/content.js"],
       "run_at": "document_start",

@@ -9,6 +9,10 @@
   if (window.__xalLoaded) return;
   window.__xalLoaded = true;
 
+  // Only the real X hosts; other subdomains (help.x.com, ads.x.com, ...) are never overlaid.
+  const X_HOST_RE = /^(www\.|mobile\.)?(x|twitter)\.com$/;
+  if (!X_HOST_RE.test(location.hostname)) return;
+
   // UI strings (SPEC §9, §13, §14, §17). Localize here; a locale file would go in .english-only-ignore.
   const STRINGS = {
     restricted: 'Restriction active',
@@ -20,7 +24,9 @@
     meter: 'Attention',
   };
 
-  const X_HOST_RE = /^(www\.|mobile\.)?(x|twitter)\.com$/;
+  const MAX_RECORDS = 1500; // LRU cap on tracked posts per tab
+  const RECORD_IDLE_MS = 30 * 60e3; // records unseen for this long are evicted
+  const MAX_INTERACTIONS = 50;
 
   // Mirrors DEFAULT_SETTINGS.cost in src/shared/defaults.js; replaced by the worker's copy on connect.
   const S = {
@@ -57,25 +63,45 @@
     },
   };
 
+  let torndown = false;
+
   // ------------------------------------------------------------ worker connection
 
   let port = null;
   let gotState = false;
+  let reconnectDelay = 1000;
+  let reconnectTimer = null;
+
+  function scheduleReconnect() {
+    if (torndown || reconnectTimer) return;
+    if (document.visibilityState === 'hidden') return; // reconnect on visibilitychange instead
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+  }
 
   function connect() {
-    if (!chrome.runtime?.id) return; // extension reloaded: this script is orphaned
+    if (torndown || port) return;
+    if (!chrome.runtime?.id) {
+      teardown(); // extension reloaded or removed: this script is orphaned
+      return;
+    }
     try {
       port = chrome.runtime.connect({ name: 'xal' });
     } catch {
       port = null;
-      setTimeout(connect, 2000);
+      if (!chrome.runtime?.id) teardown();
+      else scheduleReconnect();
       return;
     }
     port.onMessage.addListener(onWorkerMessage);
     port.onDisconnect.addListener(() => {
       port = null;
       S.active = false;
-      setTimeout(connect, 1000);
+      if (!chrome.runtime?.id) teardown();
+      else scheduleReconnect();
     });
     send({ type: 'visibility', visible: document.visibilityState === 'visible' });
   }
@@ -92,6 +118,7 @@
 
   function onWorkerMessage(msg) {
     if (msg.type === 'state') {
+      reconnectDelay = 1000;
       if (gotState && S.unlimited && !msg.unlimited) S.fromUnlimited = true;
       if (msg.mode === 'ACTIVE') S.fromUnlimited = false;
       gotState = true;
@@ -108,11 +135,14 @@
     } else if (msg.type === 'ack') {
       S.consumed = msg.consumed;
       S.limit = msg.limit || S.limit;
+      onAck(!!msg.accepted);
       renderMeter();
     }
   }
 
   document.addEventListener('visibilitychange', () => {
+    if (torndown) return;
+    if (!port && document.visibilityState === 'visible') connect();
     send({ type: 'visibility', visible: document.visibilityState === 'visible' });
   });
 
@@ -169,14 +199,15 @@
   window.addEventListener('keyup', blockKeys, true);
   window.addEventListener('keypress', blockKeys, true);
 
-  function showOverlay(kind) {
+  function showOverlay(kind, opts) {
     ensureOverlay();
     const box = overlayRoot.getElementById('box');
     if (kind === 'blackout') {
-      const ok = S.resetDone;
+      const ok = opts ? !!opts.resetDone : S.resetDone;
+      const label = S.fromUnlimited ? STRINGS.resumeAfterUnlimited : STRINGS.resume;
       box.innerHTML = `
         <div class="status"><span class="dot ${ok ? 'ok' : ''}"></span><span>${ok ? STRINGS.resetDone : STRINGS.restricted}</span></div>
-        <button id="resume">${S.fromUnlimited ? STRINGS.resumeAfterUnlimited : STRINGS.resume}</button>`;
+        <button id="resume">${label}</button>`;
       box.querySelector('#resume').addEventListener('click', () => {
         S.fromUnlimited = false;
         send({ type: 'resume' });
@@ -199,6 +230,22 @@
     overlayShown = false;
     overlayHost.style.display = 'none';
     document.documentElement.style.overflow = savedOverflow || '';
+  }
+
+  // Pre-render the overlay from the last persisted mode so the page is never briefly readable
+  // while the worker cold-starts (SPEC §9).
+  function preRenderFromStorage() {
+    try {
+      chrome.storage.local.get(['state', 'settings'], (r) => {
+        if (gotState || torndown || chrome.runtime.lastError) return;
+        const st = r && r.state;
+        if (!st || st.unlimited) return;
+        if (st.mode === 'INACTIVE') showOverlay('blackout', { resetDone: !!st.resetDone });
+        else if (st.mode === 'BLOCKED') showOverlay('block');
+      });
+    } catch {
+      /* storage unavailable: wait for the worker */
+    }
   }
 
   // ------------------------------------------------------------ meter
@@ -312,9 +359,35 @@
     return rec;
   }
 
+  // Evict idle records so a day-long infinite scroll does not grow the heap without bound.
+  function evictRecords() {
+    if (posts.size <= MAX_RECORDS) return;
+    const now = Date.now();
+    const candidates = [...posts.values()].filter((r) => !r.dirty && !(r.el && r.el.isConnected) && now - r.lastSeenAt > RECORD_IDLE_MS);
+    candidates.sort((a, b) => a.lastSeenAt - b.lastSeenAt);
+    for (const r of candidates) {
+      if (posts.size <= MAX_RECORDS) break;
+      posts.delete(r.id);
+    }
+  }
+
+  function isInsideQuote(node, root) {
+    let n = node.parentElement;
+    while (n && n !== root) {
+      if (n.getAttribute('role') === 'link' && n.tagName === 'DIV') return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
+
+  // The post id is the /status/<id> link that wraps the <time> element (the header timestamp),
+  // ignoring links inside a quoted post. The focal article of a detail page has no such link in
+  // some layouts; there the URL's own id is used.
   function extractId(el) {
-    const timeLink = el.querySelector('a[href*="/status/"] time');
-    const a = timeLink ? timeLink.closest('a') : el.querySelector('a[href*="/status/"]');
+    const links = [...el.querySelectorAll('a[href*="/status/"]')].filter((a) => !isInsideQuote(a, el));
+    let a = links.find((l) => l.querySelector('time'));
+    if (!a && route.detailId && el.getAttribute('tabindex') === '-1') return route.detailId;
+    if (!a) a = links[0];
     if (!a) return null;
     const m = /\/status\/(\d+)/.exec(a.getAttribute('href') || '');
     return m ? m[1] : null;
@@ -322,6 +395,15 @@
 
   function textOf(node) {
     return node ? (node.innerText || node.textContent || '').trim() : '';
+  }
+
+  function safeUrl(u) {
+    try {
+      const url = new URL(u, location.href);
+      return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+    } catch {
+      return '';
+    }
   }
 
   function parseUserName(un) {
@@ -349,15 +431,16 @@
     }
     const media = [];
     for (const img of el.querySelectorAll('[data-testid="tweetPhoto"] img')) {
-      if (!img.src) continue;
-      media.push({ type: 'photo', url: img.src, alt: img.alt || '', width: img.naturalWidth || null, height: img.naturalHeight || null });
+      const url = safeUrl(img.src);
+      if (!url) continue;
+      media.push({ type: 'photo', url, alt: img.alt || '', width: img.naturalWidth || null, height: img.naturalHeight || null });
     }
     for (const v of el.querySelectorAll('video')) {
       const src = v.currentSrc || v.src || '';
-      media.push({ type: 'video', url: src.startsWith('blob:') ? '' : src, poster: v.poster || '', width: v.videoWidth || null, height: v.videoHeight || null });
+      media.push({ type: 'video', url: safeUrl(src), poster: safeUrl(v.poster), width: v.videoWidth || null, height: v.videoHeight || null });
     }
     const card = el.querySelector('[data-testid="card.wrapper"] a[href]');
-    if (card) media.push({ type: 'card', url: card.href, alt: textOf(card).slice(0, 200) });
+    if (card && safeUrl(card.href)) media.push({ type: 'card', url: safeUrl(card.href), alt: textOf(card).slice(0, 200) });
     const url = handle ? `https://x.com/${handle.slice(1)}/status/${id}` : `https://x.com/i/status/${id}`;
     return { url, author, handle, text, createdAt, quote, media };
   }
@@ -372,30 +455,45 @@
   }
 
   function attachBadge(el, rec) {
-    if (badgeByEl.has(el)) return;
-    const b = document.createElement('span');
-    b.className = 'xal-badge';
-    b.textContent = rec.cost > 0 ? `+${Math.round(rec.cost)} pt` : '';
-    try {
-      if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
-    } catch {
-      /* ignore */
+    let b = badgeByEl.get(el);
+    if (!b) {
+      b = document.createElement('span');
+      b.className = 'xal-badge';
+      try {
+        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+      } catch {
+        /* ignore */
+      }
+      el.appendChild(b);
+      badgeByEl.set(el, b);
     }
-    el.appendChild(b);
-    badgeByEl.set(el, b);
+    b.textContent = rec.cost > 0 ? `+${Math.round(rec.cost)} pt` : '';
   }
 
-  function register(el) {
-    if (elToId.has(el)) return elToId.get(el);
-    const id = extractId(el);
-    if (!id) return null;
+  function bindElement(el, id) {
     elToId.set(el, id);
     const rec = getOrCreate(id);
     rec.el = el;
     if (!rec.metaComplete) refreshMeta(rec);
     attachBadge(el, rec);
+    return rec;
+  }
+
+  function register(el) {
+    if (elToId.has(el)) return elToId.get(el);
+    const id = extractId(el);
+    if (!id) return null; // not cached: a later mutation inside the article retries
+    bindElement(el, id);
     io.observe(el);
     return id;
+  }
+
+  function releaseElement(el) {
+    io.unobserve(el);
+    visibleEls.delete(el);
+    const id = elToId.get(el);
+    const rec = id && posts.get(id);
+    if (rec && rec.el === el) rec.el = null;
   }
 
   const io = new IntersectionObserver(
@@ -411,19 +509,31 @@
   function scan(root) {
     if (!(root instanceof Element)) return;
     if (root.matches('article[data-testid="tweet"]')) register(root);
+    else {
+      const parent = root.closest('article[data-testid="tweet"]');
+      if (parent) register(parent);
+    }
     for (const el of root.querySelectorAll('article[data-testid="tweet"]')) register(el);
   }
 
   const mo = new MutationObserver((muts) => {
-    for (const m of muts) for (const n of m.addedNodes) scan(n);
+    for (const m of muts) {
+      for (const n of m.addedNodes) scan(n);
+      for (const n of m.removedNodes) {
+        if (!(n instanceof Element)) continue;
+        if (elToId.has(n)) releaseElement(n);
+        for (const el of n.querySelectorAll('article[data-testid="tweet"]')) if (elToId.has(el)) releaseElement(el);
+      }
+    }
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 
   // ------------------------------------------------------------ signals: scroll, route, clicks
 
   let lastScrollAt = 0;
-  window.addEventListener('scroll', () => (lastScrollAt = performance.now()), { passive: true, capture: true });
-  window.addEventListener('wheel', () => (lastScrollAt = performance.now()), { passive: true, capture: true });
+  const onScroll = () => (lastScrollAt = performance.now());
+  window.addEventListener('scroll', onScroll, { passive: true, capture: true });
+  window.addEventListener('wheel', onScroll, { passive: true, capture: true });
 
   const route = { path: null, detailId: null, mediaId: null, mediaKey: null, mediaMs: 0 };
 
@@ -435,7 +545,7 @@
     const newDetail = m ? m[1] : null;
     if (newDetail && newDetail !== route.detailId) {
       const rec = getOrCreate(newDetail);
-      rec.interactions.push({ type: 'detail-open', ts: Date.now() });
+      pushInteraction(rec, { type: 'detail-open', ts: Date.now() });
       rec.dirty = true;
     }
     route.detailId = newDetail;
@@ -451,6 +561,11 @@
     }
   }
 
+  function pushInteraction(rec, it) {
+    rec.interactions.push(it);
+    if (rec.interactions.length > MAX_INTERACTIONS) rec.interactions.splice(0, rec.interactions.length - MAX_INTERACTIONS);
+  }
+
   function addCost(rec, delta, breakdown) {
     if (!(delta > 0)) return;
     rec.cost += delta;
@@ -460,47 +575,44 @@
   }
 
   function interact(rec, type, bonus, extra) {
-    rec.interactions.push({ type, ts: Date.now(), ...(extra || {}) });
+    pushInteraction(rec, { type, ts: Date.now(), ...(extra || {}) });
     addCost(rec, bonus, { interaction: bonus });
     rec.dirty = true;
   }
 
-  document.addEventListener(
-    'click',
-    (e) => {
-      if (!S.active) return;
-      const t = e.target instanceof Element ? e.target : null;
-      if (!t) return;
-      const C = S.cost;
-      const article = t.closest('article[data-testid="tweet"]');
-      const recOfArticle = () => {
-        if (!article) return route.detailId ? getOrCreate(route.detailId) : null;
-        const id = register(article);
-        return id ? getOrCreate(id) : null;
-      };
-      const btn = t.closest('[data-testid]');
-      const tid = btn ? btn.getAttribute('data-testid') : '';
-      const map = { like: ['like', C.likeBonus], bookmark: ['bookmark', C.bookmarkBonus], reply: ['reply', C.replyBonus], retweet: ['repost', C.repostBonus] };
-      if (map[tid]) {
-        const rec = recOfArticle();
-        if (rec) interact(rec, map[tid][0], map[tid][1]);
-        return;
-      }
-      const a = t.closest('a[href]');
-      if (a) {
-        try {
-          const u = new URL(a.getAttribute('href'), location.href);
-          if (/^https?:$/.test(u.protocol) && !X_HOST_RE.test(u.hostname)) {
-            const rec = recOfArticle();
-            if (rec) interact(rec, 'external-link', C.externalLinkBonus, { url: u.href.slice(0, 300) });
-          }
-        } catch {
-          /* ignore */
+  const onClick = (e) => {
+    if (!S.active) return;
+    const t = e.target instanceof Element ? e.target : null;
+    if (!t) return;
+    const C = S.cost;
+    const article = t.closest('article[data-testid="tweet"]');
+    const recOfArticle = () => {
+      if (!article) return route.detailId ? getOrCreate(route.detailId) : null;
+      const id = register(article);
+      return id ? getOrCreate(id) : null;
+    };
+    const btn = t.closest('[data-testid]');
+    const tid = btn ? btn.getAttribute('data-testid') : '';
+    const map = { like: ['like', C.likeBonus], bookmark: ['bookmark', C.bookmarkBonus], reply: ['reply', C.replyBonus], retweet: ['repost', C.repostBonus] };
+    if (map[tid]) {
+      const rec = recOfArticle();
+      if (rec) interact(rec, map[tid][0], map[tid][1]);
+      return;
+    }
+    const a = t.closest('a[href]');
+    if (a) {
+      try {
+        const u = new URL(a.getAttribute('href'), location.href);
+        if (/^https?:$/.test(u.protocol) && !X_HOST_RE.test(u.hostname)) {
+          const rec = recOfArticle();
+          if (rec) interact(rec, 'external-link', C.externalLinkBonus, { url: u.href.slice(0, 300) });
         }
+      } catch {
+        /* ignore */
       }
-    },
-    true
-  );
+    }
+  };
+  document.addEventListener('click', onClick, true);
 
   function playingVideo(el) {
     for (const v of el.querySelectorAll('video')) if (!v.paused && !v.ended && v.readyState > 2) return true;
@@ -510,6 +622,20 @@
   // ------------------------------------------------------------ measurement tick (100 ms)
 
   let lastTick = performance.now();
+  let lastRekeyAt = 0;
+
+  // X may reconcile a different post into an already-registered <article>; re-key when the id moved.
+  function revalidateIds() {
+    for (const el of visibleEls) {
+      const cur = elToId.get(el);
+      const fresh = extractId(el);
+      if (fresh && cur !== fresh) {
+        const old = cur && posts.get(cur);
+        if (old && old.el === el) old.el = null;
+        bindElement(el, fresh);
+      }
+    }
+  }
 
   function measure(dt, now) {
     const C = S.cost;
@@ -520,7 +646,7 @@
 
     for (const el of visibleEls) {
       if (!el.isConnected) {
-        visibleEls.delete(el);
+        releaseElement(el);
         continue;
       }
       const id = elToId.get(el);
@@ -601,13 +727,23 @@
     const now = performance.now();
     const dt = Math.min((now - lastTick) / 1000, 0.5);
     lastTick = now;
+    // Idle tabs (BLACKOUT, BLOCKED, UNLIMITED, unfocused) do no work beyond this check.
+    if (!S.active || document.visibilityState !== 'visible' || overlayShown) return;
     updateRoute();
-    if (S.active && document.visibilityState === 'visible' && !overlayShown) measure(dt, now);
+    if (now - lastRekeyAt > 1000) {
+      lastRekeyAt = now;
+      revalidateIds();
+    }
+    measure(dt, now);
     renderBadges();
   }
-  setInterval(tick, 100);
+  const tickTimer = setInterval(tick, 100);
 
   // ------------------------------------------------------------ flush to worker (1 s)
+
+  // A batch is held as `pending` until the worker acks it; a rejected or lost batch is rolled
+  // back so measured cost is never silently dropped (e.g. during the leave grace window).
+  let pending = null;
 
   function diffObj(a, b) {
     const out = {};
@@ -618,12 +754,38 @@
     return out;
   }
 
+  function rollback() {
+    if (!pending) return;
+    for (const [id, prev] of pending.prev) {
+      const rec = posts.get(id);
+      if (!rec) continue;
+      rec.sentCost = prev.sentCost;
+      rec.snap = prev.snap;
+      rec.metaSent = prev.metaSent;
+      rec.dirty = true;
+    }
+    pending = null;
+  }
+
+  function onAck(accepted) {
+    if (!pending) return;
+    if (accepted) pending = null;
+    else rollback();
+  }
+
   function flush() {
-    if (!port) return;
+    if (torndown) return;
+    if (pending) {
+      if (performance.now() - pending.at > 3000) rollback(); // ack lost
+      else return;
+    }
+    if (!port || !S.active) return;
     const items = [];
+    const prev = new Map();
     for (const rec of posts.values()) {
       if (!rec.dirty) continue;
       rec.dirty = false;
+      prev.set(rec.id, { sentCost: rec.sentCost, snap: rec.snap, metaSent: rec.metaSent });
       const item = { id: rec.id, delta: rec.cost - rec.sentCost };
       rec.sentCost = rec.cost;
       if (rec.cost >= S.minCost) {
@@ -652,16 +814,44 @@
       }
       if (item.delta > 0 || item.snapshot) items.push(item);
     }
-    if (items.length) send({ type: 'batch', items });
+    if (!items.length) return;
+    pending = { at: performance.now(), prev };
+    if (!send({ type: 'batch', items })) rollback();
+    evictRecords();
   }
-  setInterval(flush, 1000);
+  const flushTimer = setInterval(flush, 1000);
+
+  // ------------------------------------------------------------ teardown (extension reloaded)
+
+  function teardown() {
+    if (torndown) return;
+    torndown = true;
+    clearInterval(tickTimer);
+    clearInterval(flushTimer);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    hideOverlay();
+    if (overlayHost) overlayHost.remove();
+    if (meterHost) meterHost.remove();
+    styleEl.remove();
+    document.documentElement.removeAttribute('data-xal-hide');
+    window.removeEventListener('keydown', blockKeys, true);
+    window.removeEventListener('keyup', blockKeys, true);
+    window.removeEventListener('keypress', blockKeys, true);
+    window.removeEventListener('scroll', onScroll, true);
+    window.removeEventListener('wheel', onScroll, true);
+    document.removeEventListener('click', onClick, true);
+    io.disconnect();
+    mo.disconnect();
+    posts.clear();
+    visibleEls.clear();
+    window.__xalLoaded = false;
+  }
 
   // ------------------------------------------------------------ boot
 
-  function boot() {
-    scan(document.documentElement);
-    connect();
-  }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
-  else boot();
+  preRenderFromStorage();
+  connect();
+  const bootDom = () => scan(document.documentElement);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootDom, { once: true });
+  else bootDom();
 })();

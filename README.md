@@ -48,11 +48,17 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
 
 - **BLOCK release**: the reset timer starts at the moment of BLOCK; after `resetHours` of continuous
   absence a FULL RESET returns to BLACKOUT ("reset done"). No manual release exists outside Debug.
-- **Entering UNLIMITED while ACTIVE** ends the controlled session (mode → INACTIVE) and starts the
-  absence timer; usage during UNLIMITED never adds cost. Leaving UNLIMITED therefore lands on BLACKOUT
-  with the "return during the controlled period" button (SPEC §17).
+- **Entering UNLIMITED while ACTIVE** ends the controlled session (mode → INACTIVE); usage during
+  UNLIMITED never adds cost. The absence clock (SPEC §11) only runs while the user is *not on X*, in
+  any period: reading X all night does not count as absence, so the morning starts with yesterday's
+  cost on BLACKOUT with the "return during the controlled period" button (SPEC §17).
 - **Leaving X** is detected via `windows.onFocusChanged` + active-tab URL + page visibility, with a
-  `leaveGraceMs` (1.5 s) grace so focus flicker or a page reload does not trigger BLACKOUT.
+  `leaveGraceMs` (1.5 s) grace so focus flicker or a page reload does not trigger BLACKOUT. The
+  extension's own Debug page is neutral: focusing it neither counts as using X nor as leaving (SPEC §21).
+- **Browser quit while ACTIVE**: on the next start the absence is counted from the last accepted
+  measurement, so an overnight quit still yields a FULL RESET.
+- **Only `x.com`, `www.`, `mobile.` and the twitter.com equivalents** are controlled; other
+  subdomains (help, ads, business, …) are never overlaid.
 - **Snapshots** are saved only in Debug mode and only for posts with cost ≥ `snapshot.minCost`;
   retention is `retentionDays` / `maxPosts`, pruned every 6 h.
 - **Post ID** = the `/status/<id>` link that wraps the `<time>` element inside `article[data-testid="tweet"]`.

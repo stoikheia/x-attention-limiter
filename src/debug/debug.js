@@ -168,6 +168,16 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Stored URLs are scraped content: only http(s) may reach src/href (SPEC §33).
+function safeUrl(u) {
+  try {
+    const url = new URL(String(u || ''));
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
 // Renders saved text as text (SPEC §33); media URLs go only into src/href attributes.
 function postCard(p) {
   const card = el('article', 'post');
@@ -180,7 +190,7 @@ function postCard(p) {
   head.appendChild(el('span', 'handle', p.handle || ''));
   const time = el('span', 'time');
   const a = el('a', null, p.createdAt ? '· ' + fmtDT(Date.parse(p.createdAt)) : '· open');
-  a.href = p.url || `https://x.com/i/status/${p.id}`;
+  a.href = safeUrl(p.url) || `https://x.com/i/status/${encodeURIComponent(p.id)}`;
   a.target = '_blank';
   a.rel = 'noopener';
   time.appendChild(a);
@@ -196,30 +206,32 @@ function postCard(p) {
   if (Array.isArray(p.media) && p.media.length) {
     const m = el('div', 'media');
     for (const md of p.media) {
-      if (md.type === 'photo' && md.url) {
+      const url = safeUrl(md.url);
+      const poster = safeUrl(md.poster);
+      if (md.type === 'photo' && url) {
         const img = el('img');
         img.loading = 'lazy';
-        img.src = md.url;
+        img.src = url;
         img.alt = md.alt || '';
         m.appendChild(img);
       } else if (md.type === 'video') {
-        if (md.url) {
+        if (url) {
           const v = el('video');
           v.controls = true;
           v.preload = 'none';
-          v.src = md.url;
-          if (md.poster) v.poster = md.poster;
+          v.src = url;
+          if (poster) v.poster = poster;
           m.appendChild(v);
-        } else if (md.poster) {
+        } else if (poster) {
           const img = el('img');
           img.loading = 'lazy';
-          img.src = md.poster;
+          img.src = poster;
           img.alt = 'video poster';
           m.appendChild(img);
         }
-      } else if (md.type === 'card' && md.url) {
-        const c = el('a', 'card', md.alt || md.url);
-        c.href = md.url;
+      } else if (md.type === 'card' && url) {
+        const c = el('a', 'card', md.alt || url);
+        c.href = url;
         c.target = '_blank';
         c.rel = 'noopener';
         m.appendChild(c);
@@ -307,7 +319,7 @@ async function loadHistory() {
   await rpc({ type: 'flush' }).catch(() => {});
   $$('#hs-span button').forEach((b) => b.classList.toggle('on', b.dataset.span === hist.span));
   const { ms, bucket } = SPANS[hist.span];
-  const hi = Date.now();
+  const hi = Math.ceil(Date.now() / bucket) * bucket; // wall-clock aligned buckets (SPEC §26)
   const lo = hi - ms;
   const n = Math.ceil(ms / bucket);
   const buckets = new Array(n).fill(0);
@@ -320,19 +332,21 @@ async function loadHistory() {
   let acc = 0;
   for (const v of buckets) cumulative.push((acc += v));
 
-  // State segments: the state at `lo` is the last non-RESET event before it.
-  const states = await db.getStates(lo - 30 * 86400e3, hi);
-  let cur = 'ACTIVE';
+  // State segments: the state at `lo` is the last non-RESET event before it; with no history at
+  // all the extension was INACTIVE (its initial mode), never ACTIVE.
+  let prev = await db.lastStateBefore(lo);
+  if (prev && prev.state === 'RESET') {
+    const older = (await db.getStates(prev.ts - 30 * 86400e3, prev.ts)).filter((s) => s.state !== 'RESET');
+    prev = older.length ? older[older.length - 1] : null;
+  }
+  const states = await db.getStates(lo, hi);
+  let cur = prev ? prev.state : 'INACTIVE';
   let curFrom = lo;
   const segments = [];
   const markers = [];
   for (const s of states) {
     if (s.state === 'RESET') {
-      if (s.ts >= lo) markers.push({ ts: s.ts, kind: 'RESET' });
-      continue;
-    }
-    if (s.ts < lo) {
-      cur = s.state;
+      markers.push({ ts: s.ts, kind: 'RESET' });
       continue;
     }
     if (s.state === 'BLOCKED') markers.push({ ts: s.ts, kind: 'BLOCK' });
@@ -462,7 +476,7 @@ function periodRow(p) {
     const c = el('input');
     c.type = 'checkbox';
     c.dataset.day = i;
-    c.checked = !Array.isArray(p.days) || p.days.length === 0 || p.days.includes(i);
+    c.checked = !Array.isArray(p.days) || p.days.includes(i);
     l.appendChild(c);
     l.appendChild(el('span', null, n));
     days.appendChild(l);
@@ -476,7 +490,7 @@ function periodRow(p) {
   row._get = () => {
     const d = $$('input[data-day]', row).filter((c) => c.checked).map((c) => Number(c.dataset.day));
     const out = { start: s.value, end: e.value };
-    if (d.length && d.length < 7) out.days = d;
+    if (d.length < 7) out.days = d; // [] = disabled period (never matches)
     return out;
   };
   return row;
@@ -487,8 +501,8 @@ async function loadSettings() {
   if (!r || r.error) return;
   settingsCache = r.settings;
   fillSettings(settingsCache);
-  const [np, ev] = await Promise.all([db.countPosts(), db.getAttention(0, Date.now())]);
-  $('#data-stats').textContent = `${np} posts · ${ev.length} attention events`;
+  const [np, ne] = await Promise.all([db.countPosts(), db.countAttention()]);
+  $('#data-stats').textContent = `${np} posts · ${ne} attention events`;
 }
 
 function fillSettings(s) {
@@ -555,4 +569,4 @@ $('#data-clear').addEventListener('click', async () => {
 
 // ---------------------------------------------------------------- boot
 
-showTab(location.hash.slice(1) in tabs ? location.hash.slice(1) : 'status');
+showTab(Object.hasOwn(tabs, location.hash.slice(1)) ? location.hash.slice(1) : 'status');

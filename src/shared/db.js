@@ -117,6 +117,11 @@ export class XalDB {
     return req(store.index('ts').getAll(IDBKeyRange.bound(lo, hi)));
   }
 
+  async countAttention() {
+    const { store } = await this._store('attention', 'readonly');
+    return req(store.count());
+  }
+
   // ---- state events: { ts, state } ----
   async addState(ev) {
     const { tx, store } = await this._store('states', 'readwrite');
