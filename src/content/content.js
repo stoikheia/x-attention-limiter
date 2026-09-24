@@ -66,6 +66,9 @@
   };
 
   let torndown = false;
+  // Badges are tagged with the instance that created them, so a re-injected script (extension
+  // reload) can remove leftovers of an orphaned instance and an orphan removes only its own.
+  const INSTANCE_ID = Math.random().toString(36).slice(2, 10);
 
   // ------------------------------------------------------------ worker connection
 
@@ -487,8 +490,10 @@
   function attachBadge(el, rec) {
     let b = badgeByEl.get(el);
     if (!b) {
+      for (const stale of el.querySelectorAll('.xal-badge')) if (stale.dataset.xalInst !== INSTANCE_ID) stale.remove();
       b = document.createElement('span');
       b.className = 'xal-badge';
+      b.dataset.xalInst = INSTANCE_ID;
       try {
         if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
       } catch {
@@ -925,6 +930,7 @@
     clearInterval(flushTimer);
     clearInterval(heartbeatTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    for (const b of document.querySelectorAll('.xal-badge')) if (b.dataset.xalInst === INSTANCE_ID) b.remove();
     hideOverlay();
     if (overlayHost) overlayHost.remove();
     if (meterHost) meterHost.remove();
@@ -945,6 +951,14 @@
   }
 
   // ------------------------------------------------------------ boot
+
+  // Injected into an already loaded page (extension reload): clear what an orphaned older
+  // instance may have left behind — badges it never removed and, from versions before BJ-004,
+  // an inline `overflow: hidden` on <html> that made the timeline unscrollable.
+  if (document.readyState !== 'loading') {
+    for (const b of document.querySelectorAll('.xal-badge')) if (b.dataset.xalInst !== INSTANCE_ID) b.remove();
+    if (document.documentElement.style.overflow === 'hidden') document.documentElement.style.overflow = '';
+  }
 
   preRenderFromStorage();
   connect();

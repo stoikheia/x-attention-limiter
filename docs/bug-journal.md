@@ -3,6 +3,22 @@
 Real bugs in this extension found at runtime. Newest first. Library/browser-behaviour issues
 that we only work around go to `third-party-issues.md` instead.
 
+## BJ-005 — Duplicate badges and stale overflow after an extension reload (2026-09-24)
+
+- **Symptom**: after reloading the extension, posts in already open X tabs showed two `+N pt`
+  badges, and a tab that had lost scrolling before the reload (BJ-004) stayed unscrollable.
+- **Root cause**: re-injection (BJ-001) adds a second script instance to a tab. The orphaned
+  instance's teardown removed its overlay, meter and listeners but not the badges it had
+  appended inside the articles, and the new instance had no way to tell foreign badges from its
+  own. The `overflow: hidden` left on `<html>` by pre-BJ-004 versions was likewise nobody's job.
+- **Fix**: badges carry an instance id; teardown removes only its own, and a script injected into
+  an already loaded page removes foreign badges and clears a stale inline `overflow: hidden`
+  once at boot.
+- **Status**: fixed; needs confirmation (reload the extension with X tabs open: one badge per post,
+  previously stuck tabs scroll again).
+- **Lesson**: everything an instance adds to the host page must be attributable to that instance
+  and removed in teardown; re-injection makes "there is only one of me" a false assumption.
+
 ## BJ-004 — Timeline unscrollable after clearing BLACKOUT that followed a BLOCK (2026-09-24)
 
 - **Symptom**: after BLOCK, then RESET, then "Return to X", the page rendered normally but the
