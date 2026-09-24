@@ -21,6 +21,7 @@
     resumeAfterUnlimited: 'Return to X during the controlled period',
     blockedTitle: 'Attention Limit reached',
     blockedBody: 'X has been stopped',
+    idle: 'X is in use elsewhere. Click here to use it in this window.',
     meter: 'Attention',
   };
 
@@ -39,6 +40,7 @@
     limit: 10000,
     minCost: 5,
     fromUnlimited: false,
+    session: null, // worker session counter; changes on FULL RESET
     cost: {
       basePtPerSec: 10,
       minVisibleRatio: 0.15,
@@ -121,6 +123,8 @@
       reconnectDelay = 1000;
       if (gotState && S.unlimited && !msg.unlimited) S.fromUnlimited = true;
       if (msg.mode === 'ACTIVE') S.fromUnlimited = false;
+      if (msg.session != null && S.session != null && msg.session !== S.session) dropUnsentDeltas();
+      if (msg.session != null) S.session = msg.session;
       gotState = true;
       S.active = !!msg.active;
       S.mode = msg.mode;
@@ -135,7 +139,7 @@
     } else if (msg.type === 'ack') {
       S.consumed = msg.consumed;
       S.limit = msg.limit || S.limit;
-      onAck(!!msg.accepted);
+      onAck(msg.seq, !!msg.accepted);
       renderMeter();
     }
   }
@@ -149,13 +153,27 @@
   // ------------------------------------------------------------ styles
 
   const styleEl = document.createElement('style');
+  // Badge color follows X's theme (detected from the body background): dark green on the light
+  // theme, light green on dim/dark, no outline.
   styleEl.textContent = `
     .xal-badge{position:absolute;left:14px;bottom:6px;z-index:5;pointer-events:none;
-      font:600 11px/1 -apple-system,system-ui,sans-serif;color:#7ee787;
-      text-shadow:0 0 3px rgba(0,0,0,.7);letter-spacing:.02em;white-space:nowrap}
+      font:700 12px/1 -apple-system,system-ui,sans-serif;color:#7ee787;
+      letter-spacing:.02em;white-space:nowrap}
+    html[data-xal-theme="light"] .xal-badge{color:#0f7b3d}
     html[data-xal-hide] .xal-badge{display:none}
   `;
   (document.head || document.documentElement).appendChild(styleEl);
+
+  let lastThemeCheckAt = 0;
+  function detectTheme(now) {
+    if (now - lastThemeCheckAt < 2000 || !document.body) return;
+    lastThemeCheckAt = now;
+    const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(document.body).backgroundColor || '');
+    if (!m) return;
+    const lum = (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255;
+    const theme = lum > 0.5 ? 'light' : 'dark';
+    if (document.documentElement.getAttribute('data-xal-theme') !== theme) document.documentElement.setAttribute('data-xal-theme', theme);
+  }
 
   // ------------------------------------------------------------ overlay (BLACKOUT / BLOCK)
 
@@ -212,6 +230,9 @@
         S.fromUnlimited = false;
         send({ type: 'resume' });
       });
+    } else if (kind === 'idle') {
+      // This tab is not the focused X tab; focusing it (any click) makes the worker re-evaluate.
+      box.innerHTML = `<div class="status"><span class="dot"></span><span>${STRINGS.idle}</span></div>`;
     } else {
       box.innerHTML = `
         <div class="title">${STRINGS.blockedTitle}</div>
@@ -311,6 +332,7 @@
       document.documentElement.removeAttribute('data-xal-hide');
       if (S.mode === 'INACTIVE') showOverlay('blackout');
       else if (S.mode === 'BLOCKED') showOverlay('block');
+      else if (!S.active) showOverlay('idle'); // ACTIVE elsewhere: no free reading in other windows (SPEC §9)
       else hideOverlay();
     }
     renderMeter();
@@ -333,6 +355,7 @@
       detailDwellMs: 0,
       videoMs: 0,
       interactions: [],
+      newInter: [], // interactions not yet delivered to the worker
       firstSeenAt: Date.now(),
       lastSeenAt: Date.now(),
       viewOrder: ++viewCounter,
@@ -345,7 +368,7 @@
       metaSent: false,
       dirty: false,
       sentCost: 0,
-      snap: { cost: 0, breakdown: {}, timelineDwellMs: 0, detailDwellMs: 0, videoMs: 0, nInter: 0 },
+      snap: { cost: 0, breakdown: {}, timelineDwellMs: 0, detailDwellMs: 0, videoMs: 0 },
       el: null,
     };
   }
@@ -384,6 +407,7 @@
   // ignoring links inside a quoted post. The focal article of a detail page has no such link in
   // some layouts; there the URL's own id is used.
   function extractId(el) {
+    updateRoute(); // the detail id must be current even while this tab is idle
     const links = [...el.querySelectorAll('a[href*="/status/"]')].filter((a) => !isInsideQuote(a, el));
     let a = links.find((l) => l.querySelector('time'));
     if (!a && route.detailId && el.getAttribute('tabindex') === '-1') return route.detailId;
@@ -398,6 +422,7 @@
   }
 
   function safeUrl(u) {
+    if (!u) return ''; // an empty src must not resolve to the page URL
     try {
       const url = new URL(u, location.href);
       return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
@@ -480,7 +505,14 @@
   }
 
   function register(el) {
-    if (elToId.has(el)) return elToId.get(el);
+    if (elToId.has(el)) {
+      // Re-attached node (released on removal): observe again; observe() is idempotent.
+      const id = elToId.get(el);
+      const rec = posts.get(id);
+      if (rec && !rec.el) rec.el = el;
+      io.observe(el);
+      return id;
+    }
     const id = extractId(el);
     if (!id) return null; // not cached: a later mutation inside the article retries
     bindElement(el, id);
@@ -564,6 +596,8 @@
   function pushInteraction(rec, it) {
     rec.interactions.push(it);
     if (rec.interactions.length > MAX_INTERACTIONS) rec.interactions.splice(0, rec.interactions.length - MAX_INTERACTIONS);
+    rec.newInter.push(it);
+    if (rec.newInter.length > MAX_INTERACTIONS) rec.newInter.splice(0, rec.newInter.length - MAX_INTERACTIONS);
   }
 
   function addCost(rec, delta, breakdown) {
@@ -723,13 +757,20 @@
     }
   }
 
+  let lastEvictAt = 0;
+
   function tick() {
     const now = performance.now();
     const dt = Math.min((now - lastTick) / 1000, 0.5);
     lastTick = now;
-    // Idle tabs (BLACKOUT, BLOCKED, UNLIMITED, unfocused) do no work beyond this check.
+    updateRoute(); // also while idle: the detail id is needed to identify the focal article
+    detectTheme(now);
+    if (now - lastEvictAt > 30000) {
+      lastEvictAt = now;
+      evictRecords(); // records are created while browsing in any state, so evict in any state
+    }
+    // Idle tabs (BLACKOUT, BLOCKED, UNLIMITED, unfocused) do no work beyond this point.
     if (!S.active || document.visibilityState !== 'visible' || overlayShown) return;
-    updateRoute();
     if (now - lastRekeyAt > 1000) {
       lastRekeyAt = now;
       revalidateIds();
@@ -741,15 +782,19 @@
 
   // ------------------------------------------------------------ flush to worker (1 s)
 
-  // A batch is held as `pending` until the worker acks it; a rejected or lost batch is rolled
-  // back so measured cost is never silently dropped (e.g. during the leave grace window).
+  // Delivery protocol: every batch carries a sequence number and is held as `pending` until the
+  // worker acks that number. A lost ack re-sends the same batch (the worker de-duplicates by
+  // sequence), a rejected batch is rolled back so measured cost is never silently dropped, and
+  // a RESET (session change) discards deltas measured in the previous session.
   let pending = null;
+  let seq = 0;
+  const MAX_RETRIES = 3;
 
   function diffObj(a, b) {
     const out = {};
     for (const [k, v] of Object.entries(a)) {
       const d = v - (b[k] || 0);
-      if (d > 0) out[k] = d;
+      if (d !== 0) out[k] = d;
     }
     return out;
   }
@@ -762,22 +807,41 @@
       rec.sentCost = prev.sentCost;
       rec.snap = prev.snap;
       rec.metaSent = prev.metaSent;
+      rec.newInter = prev.newInter.concat(rec.newInter);
       rec.dirty = true;
     }
     pending = null;
   }
 
-  function onAck(accepted) {
-    if (!pending) return;
+  function onAck(ackSeq, accepted) {
+    if (!pending || ackSeq !== pending.seq) return; // stale ack for an earlier batch
     if (accepted) pending = null;
     else rollback();
+  }
+
+  // The worker started a new session (FULL RESET): unsent deltas belong to the old one.
+  function dropUnsentDeltas() {
+    pending = null;
+    for (const rec of posts.values()) {
+      rec.sentCost = rec.cost;
+      rec.snap = { cost: rec.cost, breakdown: { ...rec.breakdown }, timelineDwellMs: rec.timelineDwellMs, detailDwellMs: rec.detailDwellMs, videoMs: rec.videoMs };
+      rec.newInter = [];
+      rec.dirty = false;
+    }
   }
 
   function flush() {
     if (torndown) return;
     if (pending) {
-      if (performance.now() - pending.at > 3000) rollback(); // ack lost
-      else return;
+      if (performance.now() - pending.at <= 3000) return;
+      // ack lost: re-send the same sequence (worker de-duplicates) a few times, then give up
+      if (pending.tries < MAX_RETRIES && port && S.active) {
+        pending.tries++;
+        pending.at = performance.now();
+        send({ type: 'batch', seq: pending.seq, items: pending.items });
+        return;
+      }
+      rollback();
     }
     if (!port || !S.active) return;
     const items = [];
@@ -785,7 +849,7 @@
     for (const rec of posts.values()) {
       if (!rec.dirty) continue;
       rec.dirty = false;
-      prev.set(rec.id, { sentCost: rec.sentCost, snap: rec.snap, metaSent: rec.metaSent });
+      prev.set(rec.id, { sentCost: rec.sentCost, snap: rec.snap, metaSent: rec.metaSent, newInter: rec.newInter });
       const item = { id: rec.id, delta: rec.cost - rec.sentCost };
       rec.sentCost = rec.cost;
       if (rec.cost >= S.minCost) {
@@ -797,29 +861,35 @@
           timelineDwellMsDelta: rec.timelineDwellMs - sn.timelineDwellMs,
           detailDwellMsDelta: rec.detailDwellMs - sn.detailDwellMs,
           videoMsDelta: rec.videoMs - sn.videoMs,
-          interactions: rec.interactions.slice(sn.nInter),
+          interactions: rec.newInter,
           firstSeenAt: rec.firstSeenAt,
           lastSeenAt: rec.lastSeenAt,
           meta: rec.metaSent ? undefined : rec.meta || undefined,
         };
         if (rec.meta) rec.metaSent = true;
+        rec.newInter = [];
         rec.snap = {
           cost: rec.cost,
           breakdown: { ...rec.breakdown },
           timelineDwellMs: rec.timelineDwellMs,
           detailDwellMs: rec.detailDwellMs,
           videoMs: rec.videoMs,
-          nInter: rec.interactions.length,
         };
       }
       if (item.delta > 0 || item.snapshot) items.push(item);
     }
     if (!items.length) return;
-    pending = { at: performance.now(), prev };
-    if (!send({ type: 'batch', items })) rollback();
-    evictRecords();
+    seq++;
+    pending = { seq, items, at: performance.now(), prev, tries: 0 };
+    if (!send({ type: 'batch', seq, items })) rollback();
   }
   const flushTimer = setInterval(flush, 1000);
+
+  // Presence heartbeat: lets the worker keep `lastActiveAt` fresh even on pages that generate
+  // no cost (DMs, settings), so a browser quit is dated correctly.
+  const heartbeatTimer = setInterval(() => {
+    if (S.active && document.visibilityState === 'visible') send({ type: 'heartbeat' });
+  }, 10000);
 
   // ------------------------------------------------------------ teardown (extension reloaded)
 
@@ -828,12 +898,14 @@
     torndown = true;
     clearInterval(tickTimer);
     clearInterval(flushTimer);
+    clearInterval(heartbeatTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
     hideOverlay();
     if (overlayHost) overlayHost.remove();
     if (meterHost) meterHost.remove();
     styleEl.remove();
     document.documentElement.removeAttribute('data-xal-hide');
+    document.documentElement.removeAttribute('data-xal-theme');
     window.removeEventListener('keydown', blockKeys, true);
     window.removeEventListener('keyup', blockKeys, true);
     window.removeEventListener('keypress', blockKeys, true);

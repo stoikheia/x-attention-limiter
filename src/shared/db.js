@@ -112,9 +112,10 @@ export class XalDB {
     await txDone(tx);
   }
 
+  // Ranges are [lo, hi): half-open, so adjacent ranges never share an event.
   async getAttention(lo, hi) {
     const { store } = await this._store('attention', 'readonly');
-    return req(store.index('ts').getAll(IDBKeyRange.bound(lo, hi)));
+    return req(store.index('ts').getAll(IDBKeyRange.bound(lo, hi, false, true)));
   }
 
   async countAttention() {
@@ -131,7 +132,7 @@ export class XalDB {
 
   async getStates(lo, hi) {
     const { store } = await this._store('states', 'readonly');
-    return req(store.index('ts').getAll(IDBKeyRange.bound(lo, hi)));
+    return req(store.index('ts').getAll(IDBKeyRange.bound(lo, hi, false, true)));
   }
 
   // Last state event strictly before ts (to know the state at the left edge of a chart window).

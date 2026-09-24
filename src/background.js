@@ -25,11 +25,16 @@ let state = {
   lastEffective: null,
   viewCounter: 0,
   blockedAt: null,
-  lastActiveAt: 0, // last time a batch was accepted (restores the absence origin after a browser quit)
+  lastActiveAt: 0, // last accepted batch or heartbeat (restores the absence origin after a browser quit)
   lastPruneAt: 0,
+  session: 1, // incremented on every FULL RESET; content scripts drop deltas from an older session
 };
 
-const ports = new Map(); // tabId -> { port, visible }
+// A stored ACTIVE mode with no activity for this long means the worker was not running
+// (browser quit or crash): the user left X at lastActiveAt, not now.
+const STALE_ACTIVE_MS = 60e3;
+
+const ports = new Map(); // tabId -> { port, visible, lastSeq }
 let focusedWindowId = null;
 let currentXTabId = null; // the X tab that currently satisfies the ACTIVE conditions
 let leaveTimer = null;
@@ -55,6 +60,7 @@ async function init() {
     focusedWindowId = null;
   }
   chrome.alarms.create('tick', { periodInMinutes: 1 });
+  if (state.mode === 'ACTIVE' && Date.now() - (state.lastActiveAt || 0) > STALE_ACTIVE_MS) restoreAfterBrowserStart();
   refreshUnlimited();
   checkReset();
   scheduleResetAlarm();
@@ -62,7 +68,9 @@ async function init() {
   if (Date.now() - (state.lastPruneAt || 0) > 6 * 3600e3) prune();
 }
 
-// The browser was quit while ACTIVE: the absence started at the last accepted batch, not now.
+// The browser was quit (or the worker died) while ACTIVE: the absence started at the last
+// accepted batch or heartbeat, not now. Runs before refreshUnlimited() so an absence that
+// spans an UNLIMITED period is still dated from the real departure.
 function restoreAfterBrowserStart() {
   if (state.mode !== 'ACTIVE') return;
   state.mode = 'INACTIVE';
@@ -128,7 +136,7 @@ function schedulePersist() {
   persistTimer = setTimeout(() => {
     persistTimer = null;
     chrome.storage.local.set({ state });
-  }, 5000);
+  }, 2000); // bounds the cost lost if the worker dies between an ack and the write
 }
 
 function persistNow() {
@@ -223,6 +231,7 @@ function block() {
 
 function doReset(source) {
   state.consumed = 0;
+  state.session = (state.session || 1) + 1;
   state.mode = 'INACTIVE';
   state.inactiveSince = null;
   state.resetDone = true;
@@ -264,11 +273,14 @@ function refreshUnlimited() {
       state.inactiveSince = null;
       state.resetDone = false;
       chrome.alarms.clear('reset');
-    } else if (!unl && state.mode === 'INACTIVE' && state.inactiveSince == null && !state.resetDone) {
-      // Back to CONTROLLED while still on X: BLACKOUT counts as waiting (SPEC §9).
+    } else if (!unl && state.mode !== 'ACTIVE' && state.inactiveSince == null && !state.resetDone) {
+      // Back to CONTROLLED while still on X: BLACKOUT (or BLOCK) counts as waiting (SPEC §9).
       startAbsence();
     }
     commit();
+    // Presence may have changed meaning at the boundary (e.g. a foreground BLACKOUT whose
+    // absence clock must stop now that the user is using X in UNLIMITED).
+    evaluate();
   }
   const nb = nextBoundary(settings.unlimitedPeriods);
   if (nb) chrome.alarms.create('boundary', { when: nb + 500 });
@@ -366,6 +378,7 @@ function stateFor(tabId) {
     limit: settings.limit,
     cost: settings.cost,
     snapshot: { minCost: settings.snapshot.minCost },
+    session: state.session,
     active: state.mode === 'ACTIVE' && !state.unlimited && tabId === currentXTabId,
   };
 }
@@ -405,6 +418,12 @@ function onPortMessage(tabId, msg) {
     case 'resume':
       resume();
       break;
+    case 'heartbeat':
+      if (state.mode === 'ACTIVE' && !state.unlimited && tabId === currentXTabId) {
+        state.lastActiveAt = Date.now();
+        schedulePersist();
+      }
+      break;
     case 'batch':
       onBatch(tabId, msg);
       break;
@@ -414,8 +433,13 @@ function onPortMessage(tabId, msg) {
 }
 
 function onBatch(tabId, msg) {
-  const accept = state.mode === 'ACTIVE' && !state.unlimited && tabId === currentXTabId;
-  if (accept && Array.isArray(msg.items)) {
+  const p0 = ports.get(tabId);
+  const seq = Number(msg.seq) || 0;
+  // A re-sent batch whose ack was lost: already applied, ack again without charging.
+  const duplicate = !!(p0 && p0.lastSeq != null && seq !== 0 && seq === p0.lastSeq);
+  const accept = duplicate || (state.mode === 'ACTIVE' && !state.unlimited && tabId === currentXTabId);
+  if (accept && p0) p0.lastSeq = seq;
+  if (accept && !duplicate && Array.isArray(msg.items)) {
     const now = Date.now();
     let total = 0;
     for (const it of msg.items) {
@@ -437,7 +461,7 @@ function onBatch(tabId, msg) {
   const p = ports.get(tabId);
   if (p) {
     try {
-      p.port.postMessage({ type: 'ack', accepted: accept, consumed: state.consumed, limit: settings.limit });
+      p.port.postMessage({ type: 'ack', seq, accepted: accept, consumed: state.consumed, limit: settings.limit });
     } catch {
       /* port gone */
     }
