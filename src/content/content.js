@@ -34,6 +34,7 @@
 
   // Mirrors DEFAULT_SETTINGS.cost in src/shared/defaults.js; replaced by the worker's copy on connect.
   const S = {
+    tabId: null,
     active: false,
     mode: 'INACTIVE',
     unlimited: false,
@@ -44,6 +45,7 @@
     minCost: 5,
     fromUnlimited: false,
     blockPending: false, // LIMIT reached; what is on screen may still be finished
+    blockPendingTabId: null,
     session: null, // worker session counter; changes on FULL RESET
     block: {
       tolerancePx: 120,
@@ -139,6 +141,7 @@
       if (msg.session != null && S.session != null && msg.session !== S.session) dropUnsentDeltas();
       if (msg.session != null) S.session = msg.session;
       gotState = true;
+      S.tabId = msg.tabId;
       S.active = !!msg.active;
       S.mode = msg.mode;
       S.unlimited = !!msg.unlimited;
@@ -147,6 +150,7 @@
       S.consumed = msg.consumed || 0;
       S.limit = msg.limit || S.limit;
       S.blockPending = !!msg.blockPending;
+      S.blockPendingTabId = msg.blockPendingTabId;
       if (msg.block) S.block = { ...S.block, ...msg.block };
       if (msg.cost) S.cost = { ...S.cost, ...msg.cost };
       if (msg.snapshot && msg.snapshot.minCost != null) S.minCost = msg.snapshot.minCost;
@@ -723,8 +727,10 @@
   const pend = { armed: false, stage: 'extent', armedAt: 0, top: 0, bottom: 0, path: null, detailId: null, sent: false, allowed: new Set() };
   const masks = new Set();
   let maskByEl = new WeakMap();
+  let pendingTabNavigationSent = false;
 
   function armPending() {
+    updateRoute();
     pend.armed = true;
     pend.sent = false;
     if (S.block.repliesFirst && route.detailId) {
@@ -743,19 +749,19 @@
   // Start (or switch to) the extent stage: the posts on screen right now may be finished, every
   // other one is masked, and the pending clock restarts from this moment.
   function enterExtentStage() {
+    updateRoute();
     const H = window.innerHeight;
     const sy = window.scrollY;
     let top = Infinity;
     let bottom = -Infinity;
     const allowed = new Set();
-    for (const el of visibleEls) {
-      if (!el.isConnected) continue;
-      const r = el.getBoundingClientRect();
+    for (const rec of posts.values()) {
+      if (!rec.el || !rec.el.isConnected) continue;
+      const r = rec.el.getBoundingClientRect();
       if (r.height <= 0 || r.bottom <= 0 || r.top >= H) continue;
       top = Math.min(top, r.top + sy);
       bottom = Math.max(bottom, r.bottom + sy);
-      const id = elToId.get(el);
-      if (id) allowed.add(id); // a partially visible post is allowed in full: it is being read
+      allowed.add(rec.id); // a partially visible post is allowed in full: it is being read
     }
     if (!(top < bottom)) {
       top = sy; // no post on screen (DMs, settings): the viewport itself is the extent
@@ -785,7 +791,10 @@
   function maskPost(el, id) {
     if (!pend.armed || pend.stage !== 'extent' || !id || pend.allowed.has(id)) return;
     const cur = maskByEl.get(el);
-    if (cur && cur.isConnected) return;
+    if (cur && cur.isConnected) {
+      masks.add(cur);
+      return;
+    }
     const m = document.createElement('div');
     m.className = 'xal-mask';
     m.dataset.xalInst = INSTANCE_ID;
@@ -803,7 +812,7 @@
   function applyMasks() {
     if (!pend.armed || pend.stage !== 'extent') return;
     for (const m of masks) if (!m.isConnected) masks.delete(m);
-    for (const el of visibleEls) if (el.isConnected) maskPost(el, elToId.get(el));
+    for (const rec of posts.values()) if (rec.el && rec.el.isConnected) maskPost(rec.el, rec.id);
   }
 
   function isMasked(el) {
@@ -812,22 +821,28 @@
   }
 
   // Mirrors shouldBlock() in src/shared/blockpending.js (content scripts cannot import modules);
-  // keep the two in sync. Precedence when several conditions hold: timeout > navigation > scroll.
-  // 'stage2' is not a block: the replies stage is over and the extent stage takes over.
+  // keep the two in sync. Precedence when several conditions hold: navigation > timeout > scroll.
+  // 'stage2' is a non-blocking sentinel: the replies stage is over and the extent stage takes over.
   function pendingReason(now) {
     const B = S.block;
     const replies = pend.stage === 'replies';
     const routeChanged = location.pathname !== pend.path;
-    const sameDetail = pend.detailId != null && route.detailId === pend.detailId;
-    if (now - pend.armedAt > B.maxPendingMs) return replies ? 'stage2' : 'timeout';
+    const sameDetail = pend.detailId != null && route.detailId === pend.detailId && /\/status\/\d+(\/(photo|video)\/\d+)?\/?$/.test(location.pathname);
     if (routeChanged && B.onNavigation && !(replies && sameDetail)) return 'navigation';
+    if (now - pend.armedAt > B.maxPendingMs) return replies ? 'stage2' : 'timeout';
     if (replies) return null; // the replies of the post being finished: scrolling is not new information
     if (window.scrollY < pend.top - B.tolerancePx || window.scrollY + window.innerHeight > pend.bottom + B.tolerancePx) return 'scroll';
     return null;
   }
 
   function syncPending() {
+    if (!S.blockPending) pendingTabNavigationSent = false;
     const want = S.blockPending && S.active && S.mode === 'ACTIVE' && !S.unlimited;
+    if (want && S.blockPendingTabId != null && S.blockPendingTabId !== S.tabId) {
+      if (pend.armed) disarmPending();
+      if (!pendingTabNavigationSent && send({ type: 'blockNow', reason: 'navigation' })) pendingTabNavigationSent = true;
+      return;
+    }
     if (want && !pend.armed) armPending();
     else if (!want && pend.armed) disarmPending();
   }
@@ -845,6 +860,12 @@
       if (fresh && cur !== fresh) {
         const old = cur && posts.get(cur);
         if (old && old.el === el) old.el = null;
+        const mask = maskByEl.get(el);
+        if (mask) {
+          mask.remove();
+          masks.delete(mask);
+        }
+        maskByEl.delete(el);
         bindElement(el, fresh);
       }
     }
@@ -902,7 +923,8 @@
       addCost(rec, delta, bd);
     }
 
-    if (route.detailId) {
+    const detailRec = posts.get(route.detailId);
+    if (route.detailId && !(detailRec && detailRec.el && isMasked(detailRec.el))) {
       const rec = getOrCreate(route.detailId);
       rec.detailDwellMs += dt * 1000;
       addCost(rec, C.detailPtPerSec * dt, { detail: C.detailPtPerSec * dt });
@@ -911,7 +933,8 @@
         interact(rec, 'detail', C.detailBonus, { dwellMs: Math.round(rec.detailDwellMs) });
       }
     }
-    if (route.mediaId) {
+    const mediaRec = posts.get(route.mediaId);
+    if (route.mediaId && !(mediaRec && mediaRec.el && isMasked(mediaRec.el))) {
       route.mediaMs += dt * 1000;
       const rec = getOrCreate(route.mediaId);
       if (route.mediaMs >= C.mediaMinMs && !rec.mediaBonusKeys.has(route.mediaKey)) {
@@ -951,7 +974,7 @@
     }
     // Idle tabs (BLACKOUT, BLOCKED, UNLIMITED, unfocused) do no work beyond this point.
     if (!S.active || document.visibilityState !== 'visible' || overlayShown) return;
-    if (now - lastRekeyAt > 1000) {
+    if (pend.armed || now - lastRekeyAt > 1000) {
       lastRekeyAt = now;
       revalidateIds();
     }

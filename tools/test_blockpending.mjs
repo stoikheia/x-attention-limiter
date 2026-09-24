@@ -47,9 +47,9 @@ check(at({ routeChanged: true, onNavigation: false }) === null, 'route change wi
 check(at({ now: ARMED_AT + 300001 }) === 'timeout', 'past maxPendingMs: timeout');
 check(at({ now: ARMED_AT + 300000 }) === null, 'exactly maxPendingMs: not yet');
 
-// Deterministic precedence when several conditions hold: timeout > navigation > scroll.
+// Deterministic precedence when several conditions hold: navigation > timeout > scroll.
 const all = { scrollY: 0, routeChanged: true, now: ARMED_AT + 300001 };
-check(shouldBlock({ ...BASE, ...all }) === 'timeout', 'timeout wins over navigation and scroll');
+check(shouldBlock({ ...BASE, ...all }) === 'navigation', 'navigation wins over timeout and scroll');
 check(shouldBlock({ ...BASE, ...all, now: ARMED_AT + 5000 }) === 'navigation', 'navigation wins over scroll');
 check(shouldBlock({ ...BASE, ...all, now: ARMED_AT + 5000, onNavigation: false }) === 'scroll', 'scroll remains when navigation is off');
 
@@ -72,7 +72,7 @@ check(rep({ routeChanged: true, sameDetail: false, onNavigation: false }) === nu
 // Running out of time in the replies stage switches to the extent stage instead of blocking.
 check(rep({ now: ARMED_AT + 300001 }) === 'stage2', 'past maxPendingMs in the replies stage: stage-2 sentinel');
 check(rep({ now: ARMED_AT + 300000 }) === null, 'exactly maxPendingMs in the replies stage: not yet');
-check(rep({ now: ARMED_AT + 300001, sameDetail: false, routeChanged: true }) === 'stage2', 'the stage switch wins over navigation');
+check(rep({ now: ARMED_AT + 300001, sameDetail: false, routeChanged: true }) === 'navigation', 'navigation wins over the stage switch');
 check(shouldBlock({ ...BASE, stage: 'extent', now: ARMED_AT + 300001 }) === 'timeout', 'the extent stage still times out into a block');
 
 if (failures > 0) {

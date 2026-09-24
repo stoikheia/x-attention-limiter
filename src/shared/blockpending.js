@@ -16,13 +16,13 @@
 // `pendingReason()`; keep the two in sync.
 //
 // Returns the block reason, or null while the session may continue. When several conditions hold
-// at once the precedence is timeout > navigation > scroll. The one return value that is not a
+// at once the precedence is navigation > timeout > scroll. The one return value that is not a
 // block is the `'stage2'` sentinel: the replies stage ran out of time, and the caller switches to
 // the extent stage (fresh `armedAt`, extent recorded, masks applied) instead of blocking.
 export function shouldBlock({ stage = 'extent', sameDetail = false, scrollY, innerHeight, extentTop, extentBottom, tolerancePx, routeChanged, onNavigation, armedAt, now, maxPendingMs }) {
   const replies = stage === 'replies';
-  if (now - armedAt > maxPendingMs) return replies ? 'stage2' : 'timeout';
   if (routeChanged && onNavigation && !(replies && sameDetail)) return 'navigation';
+  if (now - armedAt > maxPendingMs) return replies ? 'stage2' : 'timeout';
   if (replies) return null; // the replies of the post being finished: scrolling is not new information
   if (scrollY < extentTop - tolerancePx || scrollY + innerHeight > extentBottom + tolerancePx) return 'scroll';
   return null;

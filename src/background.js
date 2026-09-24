@@ -26,6 +26,7 @@ let state = {
   viewCounter: 0,
   blockPending: false, // LIMIT reached; the user may finish what is on screen (SPEC Amendments v0.3)
   blockPendingSince: null,
+  blockPendingTabId: null,
   blockReason: null, // what ended the pending window: 'scroll' | 'navigation' | 'timeout' | ...
   blockedAt: null,
   lastActiveAt: 0, // last accepted batch or heartbeat (restores the absence origin after a browser quit)
@@ -142,6 +143,7 @@ function clampSettings(s) {
 
 async function applySettings(next) {
   settings = clampSettings(next);
+  if (state.blockPending) scheduleBlockPendingAlarm();
   await chrome.storage.local.set({ settings });
   refreshUnlimited();
   scheduleResetAlarm();
@@ -255,6 +257,7 @@ function armBlockPending() {
   if (state.blockPending || state.mode !== 'ACTIVE') return;
   state.blockPending = true;
   state.blockPendingSince = Date.now();
+  state.blockPendingTabId = currentXTabId;
   state.blockReason = null;
   scheduleBlockPendingAlarm();
   commit();
@@ -264,12 +267,14 @@ function scheduleBlockPendingAlarm() {
   // Backstop for a stopped content script. With `repliesFirst` the window runs in two stages
   // (SPEC Amendments v0.3 A2), so the alarm must not fire before the second one is over.
   const stages = settings.block.repliesFirst ? 2 : 1;
-  chrome.alarms.create('blockPending', { when: (state.blockPendingSince || Date.now()) + stages * settings.block.maxPendingMs });
+  // Content-side timers start slightly later than the worker's, so the backstop must not fire first.
+  chrome.alarms.create('blockPending', { when: (state.blockPendingSince || Date.now()) + stages * settings.block.maxPendingMs + 15000 });
 }
 
 function clearBlockPending() {
   state.blockPending = false;
   state.blockPendingSince = null;
+  state.blockPendingTabId = null;
   chrome.alarms.clear('blockPending');
 }
 
@@ -482,6 +487,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 function stateFor(tabId) {
   return {
     type: 'state',
+    tabId,
     mode: state.mode,
     unlimited: state.unlimited,
     resetDone: state.resetDone,
@@ -489,6 +495,7 @@ function stateFor(tabId) {
     consumed: state.consumed,
     limit: settings.limit,
     blockPending: !!state.blockPending,
+    blockPendingTabId: state.blockPendingTabId,
     block: settings.block,
     cost: settings.cost,
     snapshot: { minCost: settings.snapshot.minCost },
