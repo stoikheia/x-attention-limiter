@@ -4,6 +4,7 @@
 import { XalDB } from '../shared/db.js';
 import { isValidPeriod, nextBoundary } from '../shared/periods.js';
 import { HistoryChart } from './chart.js';
+import { buildAnalysisMarkdown } from './export.js';
 
 const db = new XalDB();
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -555,6 +556,39 @@ $('#data-export').addEventListener('click', async () => {
   const a = el('a');
   a.href = url;
   a.download = `x-attention-limiter-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+});
+
+$('#data-export-ai').addEventListener('click', async () => {
+  await rpc({ type: 'flush' }).catch(() => {});
+  const [posts, attention, states, r] = await Promise.all([
+    db.getAllPosts(),
+    db.getAttention(0, Number.MAX_SAFE_INTEGER),
+    db.getStates(0, Number.MAX_SAFE_INTEGER),
+    rpc({ type: 'getState' }),
+  ]);
+  if (!r || r.error) return;
+  const md = buildAnalysisMarkdown({
+    posts,
+    attention,
+    states,
+    settings: r.settings,
+    state: r.state,
+    now: Date.now(),
+    range: review.range, // the History drill-down filter, if any; null = all retained data
+    version: chrome.runtime.getManifest().version,
+  });
+  const blob = new Blob([md], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a');
+  a.href = url;
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}-${p(d.getMinutes())}`;
+  a.download = `x-attention-limiter-analysis-${stamp}.md`;
   document.body.appendChild(a);
   a.click();
   a.remove();

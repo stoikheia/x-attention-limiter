@@ -21,7 +21,7 @@ Debug mode is ON by default (SPEC §18-19): the meter shows exact numbers and po
 |---|---|---|
 | Service worker | `src/background.js` | Global state machine (`ACTIVE` / `INACTIVE`=BLACKOUT / `BLOCKED`, `UNLIMITED` overlay), focus tracking, 2 h reset timer, IndexedDB writer |
 | Content script | `src/content/content.js` | Post tracking (IntersectionObserver + MutationObserver), cost model at 100 ms, `+xxx pt` badges, meter, BLACKOUT / BLOCK overlays |
-| Debug page | `src/debug/` | Status, Attention Review (X-like timeline, manual Low/Normal/High labels), Attention History (line chart, state backgrounds, RESET/BLOCK markers, range → Review drill-down), Settings |
+| Debug page | `src/debug/` | Status, Attention Review (X-like timeline, manual Low/Normal/High labels), Attention History (line chart, state backgrounds, RESET/BLOCK markers, range → Review drill-down), Settings, data export (raw JSON, and an "Export for AI" Markdown analysis pack built by `src/debug/export.js`) |
 | Shared | `src/shared/` | IndexedDB helper, default settings, UNLIMITED period logic |
 
 Data lives in IndexedDB (`posts`, `attention`, `states`) and `chrome.storage.local` (settings, state).
@@ -70,7 +70,14 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
 ```
 python3 tools/gen_icons.py     # regenerate icons/ (needs Pillow)
 node --check src/content/content.js
+node tools/test_export.mjs     # tests the "Export for AI" Markdown builder (src/debug/export.js)
 ```
+
+The Debug page's Settings tab has an **Export for AI (Markdown)** button next to Export JSON: it
+builds a single self-describing Markdown file (settings, a summary, and CSV tables of posts,
+per-minute attention and state events) meant to be pasted into an AI assistant to help tune the
+cost coefficients and the LIMIT against your own Low/Normal/High labels. Like everything else in
+this extension, it is never sent anywhere automatically (SPEC §33) — only downloaded.
 
 Reload the extension from `chrome://extensions` after editing. Open X tabs are re-injected
 automatically on install and reload (`scripting` permission); the previous script tears itself
