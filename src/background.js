@@ -127,6 +127,7 @@ function clampSettings(s) {
     s.block[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : DEFAULT_SETTINGS.block[k];
   }
   s.block.onNavigation = !!s.block.onNavigation;
+  s.block.repliesFirst = !!s.block.repliesFirst;
   for (const k of Object.keys(DEFAULT_SETTINGS.cost)) {
     const v = Number(s.cost[k]);
     s.cost[k] = Number.isFinite(v) && v >= 0 ? v : DEFAULT_SETTINGS.cost[k];
@@ -260,7 +261,10 @@ function armBlockPending() {
 }
 
 function scheduleBlockPendingAlarm() {
-  chrome.alarms.create('blockPending', { when: (state.blockPendingSince || Date.now()) + settings.block.maxPendingMs });
+  // Backstop for a stopped content script. With `repliesFirst` the window runs in two stages
+  // (SPEC Amendments v0.3 A2), so the alarm must not fire before the second one is over.
+  const stages = settings.block.repliesFirst ? 2 : 1;
+  chrome.alarms.create('blockPending', { when: (state.blockPendingSince || Date.now()) + stages * settings.block.maxPendingMs });
 }
 
 function clearBlockPending() {

@@ -53,6 +53,28 @@ check(shouldBlock({ ...BASE, ...all }) === 'timeout', 'timeout wins over navigat
 check(shouldBlock({ ...BASE, ...all, now: ARMED_AT + 5000 }) === 'navigation', 'navigation wins over scroll');
 check(shouldBlock({ ...BASE, ...all, now: ARMED_AT + 5000, onNavigation: false }) === 'scroll', 'scroll remains when navigation is off');
 
+// Stage 1 of a pending window armed on a post's detail page (SPEC Amendments v0.3 A2): the
+// replies are part of finishing the post, so scrolling is not new information and there is no
+// extent to leave.
+const REPLIES = { ...BASE, stage: 'replies', sameDetail: true };
+const rep = (over) => shouldBlock({ ...REPLIES, ...over });
+
+check(rep({}) === null, 'replies stage on the same post: no block');
+check(rep({ scrollY: 1900 - 121 }) === null, 'replies stage ignores scrolling above the extent');
+check(rep({ scrollY: 2200 + 121 }) === null, 'replies stage ignores scrolling below the extent');
+check(rep({ scrollY: 1e6, tolerancePx: 0 }) === null, 'replies stage ignores scrolling however far');
+
+// The media viewer of the same post is a new path but still that post; another path is not.
+check(rep({ routeChanged: true }) === null, 'same post on a new path (media viewer): no navigation');
+check(rep({ routeChanged: true, sameDetail: false }) === 'navigation', 'a different path: navigation');
+check(rep({ routeChanged: true, sameDetail: false, onNavigation: false }) === null, 'a different path with onNavigation off: no block');
+
+// Running out of time in the replies stage switches to the extent stage instead of blocking.
+check(rep({ now: ARMED_AT + 300001 }) === 'stage2', 'past maxPendingMs in the replies stage: stage-2 sentinel');
+check(rep({ now: ARMED_AT + 300000 }) === null, 'exactly maxPendingMs in the replies stage: not yet');
+check(rep({ now: ARMED_AT + 300001, sameDetail: false, routeChanged: true }) === 'stage2', 'the stage switch wins over navigation');
+check(shouldBlock({ ...BASE, stage: 'extent', now: ARMED_AT + 300001 }) === 'timeout', 'the extent stage still times out into a block');
+
 if (failures > 0) {
   console.error(`${failures} check(s) failed.`);
   process.exit(1);

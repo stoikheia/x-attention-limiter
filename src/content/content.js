@@ -24,6 +24,7 @@
     idle: 'X is in use elsewhere. Click here to use it in this window.',
     meter: 'Attention',
     pending: 'Limit reached — finish what is on screen',
+    pendingReplies: 'Limit reached — finish this thread',
     masked: 'Hidden — limit reached',
   };
 
@@ -48,6 +49,7 @@
       tolerancePx: 120,
       maxPendingMs: 300000,
       onNavigation: true,
+      repliesFirst: true,
     },
     cost: {
       basePtPerSec: 10,
@@ -343,7 +345,9 @@
       b.className = 'b' + (i < on ? (pending || ratio >= 0.9 ? ' crit' : ratio >= 0.7 ? ' hot' : ' on') : '');
     });
     meterRoot.getElementById('m').className = 'm' + (pending ? ' pending' : '');
-    meterRoot.getElementById('p').style.display = pending ? '' : 'none'; // shown outside Debug too
+    const p = meterRoot.getElementById('p');
+    p.style.display = pending ? '' : 'none'; // shown outside Debug too
+    p.textContent = pend.armed && pend.stage === 'replies' ? STRINGS.pendingReplies : STRINGS.pending;
     const d = meterRoot.getElementById('d');
     if (S.debug) {
       d.style.display = '';
@@ -712,11 +716,33 @@
   // The LIMIT is reached, but the post being read is not cut in half: the posts that were on
   // screen at that moment may be finished, and X ends as soon as new information arrives. Every
   // other post is covered by an opaque mask, so the scroll tolerance cannot buy extra reading.
-  const pend = { armed: false, armedAt: 0, top: 0, bottom: 0, path: null, sent: false, allowed: new Set() };
+  //
+  // On a post's detail page the window opens in the `replies` stage instead (A2): its replies are
+  // part of finishing the post, so nothing is masked and only leaving the post ends the window.
+  // When the stage runs out of time the `extent` stage above takes over from that moment.
+  const pend = { armed: false, stage: 'extent', armedAt: 0, top: 0, bottom: 0, path: null, detailId: null, sent: false, allowed: new Set() };
   const masks = new Set();
   let maskByEl = new WeakMap();
 
   function armPending() {
+    pend.armed = true;
+    pend.sent = false;
+    if (S.block.repliesFirst && route.detailId) {
+      pend.stage = 'replies';
+      pend.armedAt = Date.now();
+      pend.path = location.pathname;
+      pend.detailId = route.detailId;
+      pend.top = 0;
+      pend.bottom = 0;
+      pend.allowed = new Set();
+      return;
+    }
+    enterExtentStage();
+  }
+
+  // Start (or switch to) the extent stage: the posts on screen right now may be finished, every
+  // other one is masked, and the pending clock restarts from this moment.
+  function enterExtentStage() {
     const H = window.innerHeight;
     const sy = window.scrollY;
     let top = Infinity;
@@ -736,17 +762,20 @@
       bottom = sy + H;
     }
     pend.armed = true;
+    pend.stage = 'extent';
     pend.armedAt = Date.now();
     pend.top = top;
     pend.bottom = bottom;
-    pend.path = location.pathname;
-    pend.sent = false;
+    pend.path = location.pathname; // re-read: the replies stage may have ended on the media viewer
+    pend.detailId = route.detailId;
     pend.allowed = allowed;
     applyMasks();
+    renderMeter();
   }
 
   function disarmPending() {
     pend.armed = false;
+    pend.stage = 'extent';
     pend.allowed = new Set();
     for (const m of masks) m.remove();
     masks.clear();
@@ -754,7 +783,7 @@
   }
 
   function maskPost(el, id) {
-    if (!pend.armed || !id || pend.allowed.has(id)) return;
+    if (!pend.armed || pend.stage !== 'extent' || !id || pend.allowed.has(id)) return;
     const cur = maskByEl.get(el);
     if (cur && cur.isConnected) return;
     const m = document.createElement('div');
@@ -772,7 +801,7 @@
   }
 
   function applyMasks() {
-    if (!pend.armed) return;
+    if (!pend.armed || pend.stage !== 'extent') return;
     for (const m of masks) if (!m.isConnected) masks.delete(m);
     for (const el of visibleEls) if (el.isConnected) maskPost(el, elToId.get(el));
   }
@@ -784,10 +813,15 @@
 
   // Mirrors shouldBlock() in src/shared/blockpending.js (content scripts cannot import modules);
   // keep the two in sync. Precedence when several conditions hold: timeout > navigation > scroll.
+  // 'stage2' is not a block: the replies stage is over and the extent stage takes over.
   function pendingReason(now) {
     const B = S.block;
-    if (now - pend.armedAt > B.maxPendingMs) return 'timeout';
-    if (location.pathname !== pend.path && B.onNavigation) return 'navigation';
+    const replies = pend.stage === 'replies';
+    const routeChanged = location.pathname !== pend.path;
+    const sameDetail = pend.detailId != null && route.detailId === pend.detailId;
+    if (now - pend.armedAt > B.maxPendingMs) return replies ? 'stage2' : 'timeout';
+    if (routeChanged && B.onNavigation && !(replies && sameDetail)) return 'navigation';
+    if (replies) return null; // the replies of the post being finished: scrolling is not new information
     if (window.scrollY < pend.top - B.tolerancePx || window.scrollY + window.innerHeight > pend.bottom + B.tolerancePx) return 'scroll';
     return null;
   }
@@ -925,7 +959,8 @@
       applyMasks();
       if (!pend.sent) {
         const reason = pendingReason(Date.now());
-        if (reason && send({ type: 'blockNow', reason })) pend.sent = true;
+        if (reason === 'stage2') enterExtentStage();
+        else if (reason && send({ type: 'blockNow', reason })) pend.sent = true;
       }
     }
     measure(dt, now);

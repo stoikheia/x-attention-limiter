@@ -441,6 +441,7 @@ const FIELD_HELP = {
   'block.tolerancePx': 'Scroll tolerance around the posts on screen (px)',
   'block.maxPendingMs': 'Longest pending window after the LIMIT (ms)',
   'block.onNavigation': 'Navigating away from the posts on screen blocks at once',
+  'block.repliesFirst': 'On a post page, finish its replies first (scrolling does not block)',
 };
 
 function numField(path, value, label) {
@@ -528,6 +529,7 @@ function fillSettings(s) {
   bl.appendChild(numField('block.tolerancePx', s.block.tolerancePx, FIELD_HELP['block.tolerancePx']));
   bl.appendChild(numField('block.maxPendingMs', s.block.maxPendingMs, FIELD_HELP['block.maxPendingMs']));
   bl.appendChild(boolField('block.onNavigation', s.block.onNavigation, FIELD_HELP['block.onNavigation']));
+  bl.appendChild(boolField('block.repliesFirst', s.block.repliesFirst, FIELD_HELP['block.repliesFirst']));
   const c = $('#set-cost');
   c.textContent = '';
   for (const [k, v] of Object.entries(s.cost)) c.appendChild(numField(`cost.${k}`, v));

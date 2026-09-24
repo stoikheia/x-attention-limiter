@@ -1152,3 +1152,36 @@ everything else.
 
 Entering UNLIMITED ends the controlled session and with it the pending state (§17). The Attention
 Cost stays, so the next Return to X during the controlled period blocks at once.
+
+### A2. Replies are part of finishing
+
+Being cut off while reading the replies of a post feels abrupt and invites cheating, so a pending
+window opened on a post's **detail page** does not end because of scrolling. With
+`block.repliesFirst` the window runs in two stages.
+
+```text
+Attention LIMIT on a post detail page
+  ↓
+BLOCK_PENDING stage 1     finish this thread     (replies)
+  ↓ block.maxPendingMs
+BLOCK_PENDING stage 2     finish what is on screen     (extent, A1)
+  ↓ new information
+BLOCKED
+```
+
+**Stage 1 — replies.** No extent is recorded and no post is masked: the post and its replies may
+be read freely, however far the page is scrolled. The post itself is what is being finished, so
+its media viewer (`/status/<id>/photo/N`, `/video/N`) is the same page; any other path — another
+post, a timeline, a profile — is new information and blocks with reason `navigation` if
+`block.onNavigation`.
+
+**Stage 2 — extent.** When `block.maxPendingMs` have passed, stage 1 does **not** block. The
+window switches to the A1 rules from that moment: the posts on screen right now become the extent
+and the allowed set, every other post is masked, the pending clock restarts, and scroll,
+navigation and timeout all trigger BLOCK as in A1.
+
+A pending window armed on a timeline starts in stage 2, unchanged by this amendment; navigating
+from it into a post's detail page is still new information and blocks.
+
+The service worker's backstop allows for both stages: it fires at `2 × block.maxPendingMs` after
+the LIMIT when `block.repliesFirst` is on, and at `block.maxPendingMs` otherwise.

@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS = {
     tolerancePx: 120, // scrolling this far beyond the posts that were on screen still counts as finishing them
     maxPendingMs: 300000, // hard end of the pending window (5 min)
     onNavigation: true, // a route change (detail page, media viewer, another timeline) blocks at once
+    repliesFirst: true, // pending on a post's detail page: reading its replies is part of finishing it
   },
   cost: {
     basePtPerSec: 10, // full-visibility, center-of-viewport, stationary base rate

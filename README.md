@@ -54,7 +54,10 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
   next piece of new information: scrolling out of that extent by more than `block.tolerancePx`,
   navigating if `block.onNavigation`, or `block.maxPendingMs` elapsing (the worker enforces the
   timeout too). Leaving X while pending blocks on the next **Return to X**, keeping the absence
-  already accumulated. **BLOCK release**: the reset timer starts at the moment of BLOCK; after
+  already accumulated. On a post's detail page the window instead starts in a *replies* stage
+  (`block.repliesFirst`, on by default): nothing is masked and scrolling never blocks, so the
+  thread can be read to the end, and only leaving that post does — after `block.maxPendingMs` the
+  window switches to the extent rules above instead of blocking. **BLOCK release**: the reset timer starts at the moment of BLOCK; after
   `resetHours` of continuous absence a FULL RESET returns to BLACKOUT ("reset done"). No manual
   release exists outside Debug.
 - **Entering UNLIMITED while ACTIVE** ends the controlled session (mode → INACTIVE); usage during
