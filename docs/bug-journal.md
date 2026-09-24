@@ -3,6 +3,21 @@
 Real bugs in this extension found at runtime. Newest first. Library/browser-behaviour issues
 that we only work around go to `third-party-issues.md` instead.
 
+## BJ-003 — The tab-strip "+" button still did not count as leaving X (2026-09-24)
+
+- **Symptom**: after BJ-002, Cmd+T triggered BLACKOUT but opening a tab with the tab-strip "+"
+  button did not; X stayed ACTIVE while hidden until some later event.
+- **Root cause**: `tabs.onCreated`, `tabs.onActivated` and the X tab's `visibility: false` report
+  arrive almost together, so several `evaluate()` calls run concurrently. One that had queried the
+  tab before the switch (still seeing the visible X tab) completed last, set the X tab as current
+  and cleared the leave timer armed by the newer evaluations; no further event followed.
+- **Fix**: generation-number every evaluation and discard results of superseded ones (also in the
+  leave-timer callback), and re-evaluate presence every 5 s while a session is ACTIVE as a safety
+  net against any missed or mis-ordered event.
+- **Status**: fixed, awaiting confirmation in real use.
+- **Lesson**: any async "look up then decide" handler fed by bursts of browser events needs
+  last-writer-wins protection; a periodic self-check turns a rare stuck state into a 5 s delay.
+
 ## BJ-002 — Opening a New Tab did not count as leaving X (2026-09-24)
 
 - **Symptom**: with X ACTIVE, pressing Cmd+T showed the New Tab Page but the X tab stayed ACTIVE

@@ -340,7 +340,9 @@ function armLeaveTimer() {
   if (!(state.mode === 'ACTIVE' || (state.unlimited && state.inactiveSince == null))) return;
   leaveTimer = setTimeout(async () => {
     leaveTimer = null;
+    const gen = ++evalGen; // supersede evaluations still in flight
     const t = await findFocusedXTab();
+    if (gen !== evalGen) return;
     if (t == null) onLeftX();
     else if (t !== 'neutral') {
       currentXTabId = t;
@@ -358,8 +360,16 @@ function onLeftX() {
   }
 }
 
+// Evaluations are generation-numbered: several can be in flight at once (tabs.onCreated,
+// tabs.onActivated and the tab's own visibility report arrive together when the "+" button
+// opens a tab), and one that looked up the tab before the switch must not overwrite the
+// conclusion of a newer one, otherwise it cancels the leave timer and X stays ACTIVE hidden.
+let evalGen = 0;
+
 async function evaluate() {
+  const gen = ++evalGen;
   const found = await findFocusedXTab();
+  if (gen !== evalGen) return; // superseded by a newer evaluation
   const neutral = found === 'neutral';
   const xTab = neutral ? null : found;
   currentXTabId = xTab;
@@ -383,6 +393,13 @@ chrome.windows.onFocusChanged.addListener((wid) => {
   focusedWindowId = wid;
   ready.then(evaluate);
 });
+
+// Safety net: while a controlled session is in progress, re-check presence every few seconds so
+// a missed or mis-ordered browser event can never leave X ACTIVE while hidden. The worker is
+// alive whenever an X tab is connected, so a plain interval is enough.
+setInterval(() => {
+  if (state.mode === 'ACTIVE' || (state.unlimited && state.inactiveSince == null)) ready.then(evaluate);
+}, 5000);
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   activeTabByWindow.set(windowId, tabId);
   ready.then(evaluate);
