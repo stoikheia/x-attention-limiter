@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X Attention Limiter — Debug</title>
+  <link rel="stylesheet" href="debug.css" />
+</head>
+<body>
+  <header class="top">
+    <h1>X Attention Limiter <span class="sub">Debug</span></h1>
+    <nav class="tabs" id="tabs">
+      <button data-tab="status" class="on">Status</button>
+      <button data-tab="review">Review</button>
+      <button data-tab="history">History</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ============================== STATUS ============================== -->
+    <section id="tab-status" class="tab on">
+      <div class="tiles">
+        <div class="tile"><div class="k">State</div><div class="v" id="st-effective">–</div><div class="s" id="st-mode"></div></div>
+        <div class="tile"><div class="k">Consumed</div><div class="v" id="st-consumed">–</div><div class="s">pt</div></div>
+        <div class="tile"><div class="k">Limit</div><div class="v" id="st-limit">–</div><div class="s">pt</div></div>
+        <div class="tile"><div class="k">Remaining</div><div class="v" id="st-remaining">–</div><div class="s" id="st-pct"></div></div>
+        <div class="tile"><div class="k">Reset</div><div class="v" id="st-reset">–</div><div class="s" id="st-reset-at"></div></div>
+        <div class="tile"><div class="k">Unlimited</div><div class="v" id="st-unlimited">–</div><div class="s" id="st-next-boundary"></div></div>
+      </div>
+      <div class="meter"><div class="fill" id="st-bar"></div></div>
+      <div class="row muted small" id="st-tabs"></div>
+      <div class="row actions">
+        <button id="act-reset" class="danger">Debug: FULL RESET</button>
+        <button id="act-blackout">Debug: force BLACKOUT</button>
+        <button id="act-block">Debug: force BLOCK</button>
+      </div>
+      <p class="muted small">The restriction logic is identical in Debug mode; this page only exposes hidden values (SPEC §18).
+        Switching to this tab counts as leaving X, so X tabs go to BLACKOUT while you are here.</p>
+    </section>
+
+    <!-- ============================== REVIEW ============================== -->
+    <section id="tab-review" class="tab">
+      <div class="toolbar">
+        <label>Sort
+          <select id="rv-sort">
+            <option value="cost">Attention Cost</option>
+            <option value="order">View order</option>
+            <option value="recent">Last seen</option>
+          </select>
+        </label>
+        <label>Label
+          <select id="rv-label">
+            <option value="all">all</option>
+            <option value="unlabeled">unlabeled</option>
+            <option value="low">low</option>
+            <option value="normal">normal</option>
+            <option value="high">high</option>
+          </select>
+        </label>
+        <span class="chip" id="rv-range" hidden><span id="rv-range-text"></span> <button id="rv-range-clear" title="clear time filter">×</button></span>
+        <span class="muted small" id="rv-count"></span>
+        <button id="rv-reload" class="ghost">Reload</button>
+      </div>
+      <div id="rv-list" class="timeline"></div>
+      <div class="row"><button id="rv-more" class="ghost" hidden>Show more</button></div>
+    </section>
+
+    <!-- ============================== HISTORY ============================== -->
+    <section id="tab-history" class="tab">
+      <div class="toolbar">
+        <div class="seg" id="hs-span">
+          <button data-span="3h">3h</button><button data-span="6h">6h</button><button data-span="12h">12h</button>
+          <button data-span="1d">1d</button><button data-span="3d">3d</button><button data-span="7d">7d</button>
+        </div>
+        <div class="seg" id="hs-metric">
+          <button data-metric="rate" class="on">Cost Rate</button><button data-metric="cum">Cumulative</button>
+        </div>
+        <span class="muted small" id="hs-bucket"></span>
+        <button id="hs-reload" class="ghost">Reload</button>
+        <button id="hs-table-toggle" class="ghost">Table</button>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="hs-canvas" height="300"></canvas>
+        <div id="hs-tip" class="tip" hidden></div>
+      </div>
+      <div class="legend">
+        <span><i class="sw line"></i>Attention Cost</span>
+        <span><i class="sw bg-inactive"></i>INACTIVE</span>
+        <span><i class="sw bg-unlimited"></i>UNLIMITED</span>
+        <span><i class="sw bg-blocked"></i>BLOCKED</span>
+        <span><i class="sw mk-reset"></i>RESET</span>
+        <span><i class="sw mk-block"></i>BLOCK</span>
+        <span class="muted">Drag on the chart to select a range; click a bucket to select it.</span>
+      </div>
+      <div id="hs-panel" class="panel" hidden>
+        <div class="row between">
+          <strong id="hs-panel-range"></strong>
+          <span>Attention Cost: <strong id="hs-panel-total"></strong> pt</span>
+        </div>
+        <div class="muted small">High-cost posts</div>
+        <ol id="hs-panel-top" class="toplist"></ol>
+        <div class="row"><button id="hs-panel-review">Show posts in this period</button></div>
+      </div>
+      <div id="hs-table" class="table-wrap" hidden></div>
+    </section>
+
+    <!-- ============================== SETTINGS ============================== -->
+    <section id="tab-settings" class="tab">
+      <form id="settings-form" class="settings">
+        <h2>General</h2>
+        <div class="grid" id="set-general"></div>
+        <h2>Unlimited periods</h2>
+        <div id="set-periods" class="periods"></div>
+        <div class="row"><button type="button" id="set-period-add" class="ghost">+ add period</button></div>
+        <h2>Cost model</h2>
+        <div class="grid" id="set-cost"></div>
+        <h2>Snapshot retention</h2>
+        <div class="grid" id="set-snapshot"></div>
+        <div class="row actions">
+          <button type="submit">Save</button>
+          <button type="button" id="set-defaults" class="ghost">Reset to defaults</button>
+          <span class="muted small" id="set-msg"></span>
+        </div>
+      </form>
+      <h2>Data</h2>
+      <div class="row actions">
+        <button type="button" id="data-export">Export JSON</button>
+        <button type="button" id="data-clear" class="danger">Clear all data</button>
+        <span class="muted small" id="data-stats"></span>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="debug.js"></script>
+</body>
+</html>
