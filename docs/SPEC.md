@@ -1185,3 +1185,12 @@ from it into a post's detail page is still new information and blocks.
 
 The service worker's backstop allows for both stages: it fires at `2 × block.maxPendingMs` after
 the LIMIT when `block.repliesFirst` is on, and at `block.maxPendingMs` otherwise.
+
+### A3. What the overlays show and silence
+
+Videos are paused while an overlay or a mask covers them and are never resumed by the extension.
+The X content being hidden (§9) includes moving pictures and sound.
+
+BLACKOUT / BLOCK show a one- or two-line page context (Home / Search: q / author + first lines
+of the post / Profile @user / …), so tabs kept for later can be told apart, without showing any
+other content.

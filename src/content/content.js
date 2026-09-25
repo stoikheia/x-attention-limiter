@@ -26,6 +26,16 @@
     pending: 'Limit reached — finish what is on screen',
     pendingReplies: 'Limit reached — finish this thread',
     masked: 'Hidden — limit reached',
+    home: 'Home',
+    search: 'Search:',
+    profile: 'Profile',
+    bookmarks: 'Bookmarks',
+    notifications: 'Notifications',
+    messages: 'Messages',
+    explore: 'Explore',
+    list: 'List',
+    compose: 'Compose',
+    post: 'Post',
   };
 
   const MAX_RECORDS = 1500; // LRU cap on tracked posts per tab
@@ -164,11 +174,13 @@
     }
   }
 
-  document.addEventListener('visibilitychange', () => {
+  function onVisibilityChange() {
     if (torndown) return;
+    if (document.visibilityState === 'visible') refreshOverlayContext();
     if (!port && document.visibilityState === 'visible') connect();
     send({ type: 'visibility', visible: document.visibilityState === 'visible' });
-  });
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange);
 
   // ------------------------------------------------------------ styles
 
@@ -204,11 +216,77 @@
   let overlayHost = null;
   let overlayRoot = null;
   let overlayShown = false;
+  let overlayContext = null;
+  let lastContextRefreshAt = -Infinity;
+
+  function describePage() {
+    updateRoute();
+    const path = location.pathname.replace(/\/+$/, '') || '/';
+    const collapse = (text) => text.replace(/\s+/g, ' ').trim();
+    const title = collapse(document.title.replace(/\s*\/\s*(X|Twitter)\s*$/, ''));
+    const decode = (text) => {
+      try {
+        return decodeURIComponent(text);
+      } catch {
+        return text;
+      }
+    };
+    if (path === '/' || path === '/home') return { kind: 'home', text: STRINGS.home };
+    if (path === '/search') {
+      const q = new URLSearchParams(location.search).get('q') || '';
+      return { kind: 'search', text: `${STRINGS.search} ${collapse(q)}`.trim() };
+    }
+    const hashtag = /^\/hashtag\/([^/]+)$/.exec(path);
+    if (hashtag) return { kind: 'search', text: `${STRINGS.search} #${collapse(decode(hashtag[1]))}` };
+    if (route.detailId) {
+      let el = posts.get(route.detailId)?.el;
+      if (!el || !el.isConnected) {
+        el = [...document.querySelectorAll('article[data-testid="tweet"]')].find((article) => extractId(article) === route.detailId);
+      }
+      if (!el) return { kind: 'post', text: title || STRINGS.post, pending: true };
+      const meta = extractMeta(el, route.detailId);
+      const lines = meta.text.trim().split(/\r?\n/);
+      const author = collapse(`${meta.author} ${meta.handle}`);
+      const excerpt = collapse(lines.slice(0, 2).join(' '));
+      let text = author ? `${author}${excerpt ? ': ' + excerpt : ''}` : excerpt || STRINGS.post;
+      if (text.length > 140 || lines.length > 2) text = text.slice(0, 139).trimEnd() + '…';
+      return { kind: 'post', text };
+    }
+    if (path === '/i/bookmarks') return { kind: 'bookmarks', text: STRINGS.bookmarks };
+    for (const kind of ['notifications', 'messages', 'explore', 'compose']) {
+      if (path === '/' + kind || path.startsWith('/' + kind + '/')) return { kind, text: STRINGS[kind] };
+    }
+    if (path === '/i/lists' || path.startsWith('/i/lists/')) {
+      return { kind: 'list', text: title ? `${STRINGS.list}: ${title}` : STRINGS.list };
+    }
+    const user = /^\/([^/]+)$/.exec(path);
+    const reserved = ['home', 'search', 'hashtag', 'i', 'notifications', 'messages', 'explore', 'compose'];
+    if (user && !reserved.includes(user[1])) return { kind: 'profile', text: `${STRINGS.profile} @${decode(user[1])}` };
+    return { kind: 'other', text: title || location.pathname };
+  }
+
+  function refreshOverlayContext() {
+    if (!overlayShown) return;
+    lastContextRefreshAt = performance.now();
+    overlayContext = describePage();
+    overlayRoot.getElementById('ctx').textContent = overlayContext.text;
+  }
+
+  // SPEC §9 "the X content is not shown" includes moving pictures and sound.
+  // Only pause covered videos; X's own autoplay decides what resumes after uncovering.
+  function onPlay(e) {
+    const video = e.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    const article = video.closest('article');
+    if (overlayShown || (article && isMasked(article))) video.pause();
+  }
+  document.addEventListener('play', onPlay, true);
 
   function ensureOverlay() {
     if (overlayHost) return;
     overlayHost = document.createElement('div');
     overlayHost.id = 'xal-overlay-host';
+    overlayHost.dataset.xalInst = INSTANCE_ID;
     overlayHost.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none';
     overlayRoot = overlayHost.attachShadow({ mode: 'closed' });
     overlayRoot.innerHTML = `
@@ -222,6 +300,8 @@
         .dot.ok{background:#7ee787}
         .title{font-size:26px;font-weight:700;color:#fff}
         .body{font-size:15px;color:#9aa0a6}
+        .ctx{color:#71767b;font-size:13px;text-align:center;max-width:70vw;display:-webkit-box;
+          -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
         button{all:unset;cursor:pointer;padding:12px 28px;border-radius:999px;background:#eff3f4;color:#0f1419;
           font:600 15px -apple-system,system-ui,sans-serif}
         button:hover{background:#d7dbdc}
@@ -256,6 +336,7 @@
       const label = S.fromUnlimited ? STRINGS.resumeAfterUnlimited : STRINGS.resume;
       box.innerHTML = `
         <div class="status"><span class="dot ${ok ? 'ok' : ''}"></span><span>${ok ? STRINGS.resetDone : STRINGS.restricted}</span></div>
+        <div class="ctx" id="ctx"></div>
         <button id="resume">${label}</button>`;
       box.querySelector('#resume').addEventListener('click', () => {
         S.fromUnlimited = false;
@@ -263,16 +344,20 @@
       });
     } else if (kind === 'idle') {
       // This tab is not the focused X tab; focusing it (any click) makes the worker re-evaluate.
-      box.innerHTML = `<div class="status"><span class="dot"></span><span>${STRINGS.idle}</span></div>`;
+      box.innerHTML = `<div class="status"><span class="dot"></span><span>${STRINGS.idle}</span></div>
+        <div class="ctx" id="ctx"></div>`;
     } else {
       box.innerHTML = `
         <div class="title">${STRINGS.blockedTitle}</div>
-        <div class="body">${STRINGS.blockedBody}</div>`;
+        <div class="body">${STRINGS.blockedBody}</div>
+        <div class="ctx" id="ctx"></div>`;
     }
     if (!overlayShown) {
       overlayShown = true;
       overlayHost.style.display = 'block';
+      for (const video of document.querySelectorAll('video')) video.pause();
     }
+    refreshOverlayContext();
   }
 
   function hideOverlay() {
@@ -599,6 +684,7 @@
         for (const el of n.querySelectorAll('article[data-testid="tweet"]')) if (elToId.has(el)) releaseElement(el);
       }
     }
+    if (overlayShown && overlayContext?.pending && performance.now() - lastContextRefreshAt >= 500) refreshOverlayContext();
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 
@@ -807,6 +893,7 @@
     el.appendChild(m);
     maskByEl.set(el, m);
     masks.add(m);
+    for (const video of el.querySelectorAll('video')) video.pause();
   }
 
   function applyMasks() {
@@ -1126,6 +1213,9 @@
     window.removeEventListener('scroll', onScroll, true);
     window.removeEventListener('wheel', onScroll, true);
     document.removeEventListener('click', onClick, true);
+    document.removeEventListener('play', onPlay, true);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    document.removeEventListener('DOMContentLoaded', bootDom);
     io.disconnect();
     mo.disconnect();
     posts.clear();
@@ -1146,7 +1236,10 @@
 
   preRenderFromStorage();
   connect();
-  const bootDom = () => scan(document.documentElement);
+  function bootDom() {
+    scan(document.documentElement);
+    refreshOverlayContext();
+  }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootDom, { once: true });
   else bootDom();
 })();
