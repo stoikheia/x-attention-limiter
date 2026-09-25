@@ -36,11 +36,36 @@
     list: 'List',
     compose: 'Compose',
     post: 'Post',
+    lastViewed: 'last viewed',
+    opened: 'opened',
   };
 
   const MAX_RECORDS = 1500; // LRU cap on tracked posts per tab
   const RECORD_IDLE_MS = 30 * 60e3; // records unseen for this long are evicted
   const MAX_INTERACTIONS = 50;
+
+  const TAB_TIMES_KEY = 'xal.tabTimes';
+  let openedAt = null;
+  let lastViewedAt = null;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(TAB_TIMES_KEY));
+    if (Number.isFinite(saved?.openedAt)) openedAt = saved.openedAt;
+    if (Number.isFinite(saved?.lastViewedAt)) lastViewedAt = saved.lastViewedAt;
+  } catch {
+    // Storage may be unavailable; keep tab times in memory.
+  }
+  if (openedAt === null) {
+    openedAt = Date.now();
+    persistTabTimes();
+  }
+
+  function persistTabTimes() {
+    try {
+      sessionStorage.setItem(TAB_TIMES_KEY, JSON.stringify({ lastViewedAt, openedAt }));
+    } catch {
+      // Storage may be unavailable; keep tab times in memory.
+    }
+  }
 
   // Mirrors DEFAULT_SETTINGS.cost in src/shared/defaults.js; replaced by the worker's copy on connect.
   const S = {
@@ -153,6 +178,11 @@
       gotState = true;
       S.tabId = msg.tabId;
       S.active = !!msg.active;
+      if (S.active) {
+        lastViewedAt = Date.now();
+        persistTabTimes();
+        refreshOverlayContext();
+      }
       S.mode = msg.mode;
       S.unlimited = !!msg.unlimited;
       S.resetDone = !!msg.resetDone;
@@ -219,6 +249,21 @@
   let overlayContext = null;
   let lastContextRefreshAt = -Infinity;
 
+  function clipGraphemes(text, n) {
+    text = text.replace(/\s+/g, ' ').trim();
+    const chars = typeof Intl.Segmenter === 'function'
+      ? Array.from(new Intl.Segmenter('und', { granularity: 'grapheme' }).segment(text), (part) => part.segment)
+      : Array.from(text);
+    return chars.slice(0, n).join('') + (chars.length > n ? '…' : '');
+  }
+
+  function formatClock(ms) {
+    const date = new Date(ms);
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${date.getMonth() + 1}/${date.getDate()} ${hours}:${minutes}`;
+  }
+
   function describePage() {
     updateRoute();
     const path = location.pathname.replace(/\/+$/, '') || '/';
@@ -243,13 +288,11 @@
       if (!el || !el.isConnected) {
         el = [...document.querySelectorAll('article[data-testid="tweet"]')].find((article) => extractId(article) === route.detailId);
       }
-      if (!el) return { kind: 'post', text: title || STRINGS.post, pending: true };
+      if (!el) return { kind: 'post', text: clipGraphemes(title, 30) || STRINGS.post, pending: true };
       const meta = extractMeta(el, route.detailId);
-      const lines = meta.text.trim().split(/\r?\n/);
       const author = collapse(`${meta.author} ${meta.handle}`);
-      const excerpt = collapse(lines.slice(0, 2).join(' '));
-      let text = author ? `${author}${excerpt ? ': ' + excerpt : ''}` : excerpt || STRINGS.post;
-      if (text.length > 140 || lines.length > 2) text = text.slice(0, 139).trimEnd() + '…';
+      const excerpt = clipGraphemes(meta.text, 30);
+      const text = author ? `${author}${excerpt ? ': ' + excerpt : ''}` : excerpt || STRINGS.post;
       return { kind: 'post', text };
     }
     if (path === '/i/bookmarks') return { kind: 'bookmarks', text: STRINGS.bookmarks };
@@ -257,19 +300,21 @@
       if (path === '/' + kind || path.startsWith('/' + kind + '/')) return { kind, text: STRINGS[kind] };
     }
     if (path === '/i/lists' || path.startsWith('/i/lists/')) {
-      return { kind: 'list', text: title ? `${STRINGS.list}: ${title}` : STRINGS.list };
+      return { kind: 'list', text: title ? `${STRINGS.list}: ${clipGraphemes(title, 30)}` : STRINGS.list };
     }
     const user = /^\/([^/]+)$/.exec(path);
     const reserved = ['home', 'search', 'hashtag', 'i', 'notifications', 'messages', 'explore', 'compose'];
     if (user && !reserved.includes(user[1])) return { kind: 'profile', text: `${STRINGS.profile} @${decode(user[1])}` };
-    return { kind: 'other', text: title || location.pathname };
+    return { kind: 'other', text: clipGraphemes(title, 30) || location.pathname };
   }
 
   function refreshOverlayContext() {
     if (!overlayShown) return;
     lastContextRefreshAt = performance.now();
     overlayContext = describePage();
-    overlayRoot.getElementById('ctx').textContent = overlayContext.text;
+    const label = lastViewedAt === null ? STRINGS.opened : STRINGS.lastViewed;
+    const time = formatClock(lastViewedAt === null ? openedAt : lastViewedAt);
+    overlayRoot.getElementById('ctx').textContent = `${overlayContext.text} · ${label} ${time}`;
   }
 
   // SPEC §9 "the X content is not shown" includes moving pictures and sound.

@@ -51,7 +51,8 @@ The breakdown (`timeline`, `dwell`, `detail`, `video`, `interaction`) is stored 
 - **Covered videos** are paused while an overlay or post mask covers them; the extension never
   resumes playback.
 - **Overlay context** shows a muted one- or two-line page description on BLACKOUT, BLOCK and idle
-  overlays so tabs kept for later can be told apart.
+  overlays so tabs kept for later can be told apart. Post excerpts show about 30 characters after
+  the author; every context line ends with a last-viewed or opened timestamp (local M/D HH:MM).
 - **Reaching the LIMIT** does not cut a post in half: it arms BLOCK_PENDING (SPEC Amendments v0.3,
   settings under *Block timing*). The posts that were on screen at that moment may be finished —
   every other post is covered by an opaque mask and generates no cost — and X is blocked on the

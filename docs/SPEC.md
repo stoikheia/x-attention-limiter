@@ -1191,6 +1191,7 @@ the LIMIT when `block.repliesFirst` is on, and at `block.maxPendingMs` otherwise
 Videos are paused while an overlay or a mask covers them and are never resumed by the extension.
 The X content being hidden (§9) includes moving pictures and sound.
 
-BLACKOUT / BLOCK show a one- or two-line page context (Home / Search: q / author + first lines
-of the post / Profile @user / …), so tabs kept for later can be told apart, without showing any
-other content.
+BLACKOUT / BLOCK / idle show a one- or two-line page context (Home / Search: q / author + first 30
+characters of the post / Profile @user / …), so tabs kept for later can be told apart, without
+showing any other content. Every context line ends with the last-viewed or opened time (local
+M/D HH:MM).
